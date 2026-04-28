@@ -22,8 +22,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/z7743/FastCCM"
-Issues = "https://github.com/z7743/FastCCM/issues"
+Homepage = "https://github.com/pao-unit/FastCCM"
+Issues = "https://github.com/pao-unit/FastCCM/issues"
 
 [tool.setuptools.dynamic]
 version = { attr = "fastccm._version.__version__" }
