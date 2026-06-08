@@ -340,6 +340,7 @@ def auto_batch_size_simplex(
     num_ts_Y, _, max_EY = Y_lib_s.shape
     S = X_sample.shape[1]
     nX, nY, Ey, K = int(num_ts_X), int(num_ts_Y), int(max_EY), int(nbrs_num_max)
+    device_type = X_lib.device.type
 
     cbytes = _dtype_bytes(compute_dtype)
     dbytes = _dtype_bytes(dtype)
@@ -358,19 +359,27 @@ def auto_batch_size_simplex(
         extra_base_bytes=extra_base_bytes,
     )
     if target_batch_size == "auto":
-        y_batch = _calibrated_simplex_target_batch_size(
-            num_ts_X=nX,
-            num_ts_Y=nY,
-            total_samples=S,
-            library_size=L,
-            max_EY=Ey,
-            nbrs_num_max=K,
-            dtype=dtype,
-            compute_dtype=compute_dtype,
-            budget_bytes=budget_bytes,
-            max_E_X=max_E_X,
-            extra_base_bytes=extra_base_bytes,
-        )
+        if device_type == "cuda":
+            # The CPU-calibrated target tiling policy is too conservative on CUDA:
+            # for medium and even fairly large symmetric matrices, repeatedly
+            # splitting the target axis pays a much larger kernel-launch and gather
+            # overhead than the saved working-set memory. Prefer a single target
+            # block on GPU and let the outer query batch size absorb memory pressure.
+            y_batch = nY
+        else:
+            y_batch = _calibrated_simplex_target_batch_size(
+                num_ts_X=nX,
+                num_ts_Y=nY,
+                total_samples=S,
+                library_size=L,
+                max_EY=Ey,
+                nbrs_num_max=K,
+                dtype=dtype,
+                compute_dtype=compute_dtype,
+                budget_bytes=budget_bytes,
+                max_E_X=max_E_X,
+                extra_base_bytes=extra_base_bytes,
+            )
     else:
         y_batch = resolve_simplex_target_batch_size(nY, target_batch_size)
 

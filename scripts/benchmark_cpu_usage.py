@@ -16,7 +16,7 @@ import torch
 
 from benchmark_report import update_report_section
 
-DEVICE = "cpu"
+DEVICE = "cuda"
 DTYPE = "float32"
 METHOD = "simplex"
 MEMORY_BUDGET_GB = 2.0

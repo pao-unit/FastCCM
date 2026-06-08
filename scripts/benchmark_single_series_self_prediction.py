@@ -14,10 +14,10 @@ import torch
 
 from benchmark_report import update_report_section
 
-DEVICE = "cpu"
+DEVICE = "cuda"
 DTYPE = "float32"
 METHOD = "simplex"
-MEMORY_BUDGET_GB = 4.0
+MEMORY_BUDGET_GB = 16.0
 XTWX_PRECOMPUTE = True
 XTWY_PRECOMPUTE = True
 EMBED_DIM = 20
@@ -29,11 +29,12 @@ SAMPLE_SIZE: int | str | None = None
 BATCH_SIZE: int | str | None = "auto"
 LENGTHS = [2_000, 8_000, 32_000, 128_000]
 ATTEMPTS = 3
+WARMUPS = 1
 SEED = 12345
 TORCH_NUM_THREADS = int(
     os.environ.get(
         "FASTCCM_TORCH_NUM_THREADS",
-        os.environ.get("TORCH_NUM_THREADS", min(os.cpu_count() or 1, 8)),
+        os.environ.get("TORCH_NUM_THREADS", min(os.cpu_count() or 1, 32)),
     )
 )
 TORCH_NUM_INTEROP_THREADS = int(
@@ -89,10 +90,16 @@ def resolve_case_parameters(length: int) -> tuple[int, int, int, int]:
     return embedded_length, library_size, sample_size, exclusion_window
 
 
+def synchronize_device(device: str) -> None:
+    if device.startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
 def run_one(
     ccm: PairwiseCCM,
     length: int,
     attempts: int,
+    warmups: int,
     base_seed: int,
 ) -> dict[str, float | int]:
     embedded_length, library_size, sample_size, exclusion_window = resolve_case_parameters(
@@ -100,7 +107,7 @@ def run_one(
     )
     timings: list[float] = []
 
-    for attempt in range(attempts):
+    for attempt in range(warmups + attempts):
         rng = np.random.default_rng(base_seed + attempt)
         series = rng.standard_normal(length, dtype=np.float32)
         x_emb = get_td_embedding_np(series[:, None], dim=EMBED_DIM, stride=TAU)[
@@ -108,6 +115,7 @@ def run_one(
         ].astype(np.float32, copy=False)
         y_emb = series[:, None].astype(np.float32, copy=False)
 
+        synchronize_device(ccm.device)
         t0 = time.perf_counter()
         _ = ccm.score_matrix(
             X_emb=[x_emb],
@@ -123,7 +131,9 @@ def run_one(
             seed=base_seed + attempt,
             clean_after=False,
         )
-        timings.append(time.perf_counter() - t0)
+        synchronize_device(ccm.device)
+        if attempt >= warmups:
+            timings.append(time.perf_counter() - t0)
 
     return {
         "length": length,
@@ -161,6 +171,7 @@ def main() -> None:
         "xtwx_precompute": XTWX_PRECOMPUTE,
         "xtwy_precompute": XTWY_PRECOMPUTE,
         "attempts": ATTEMPTS,
+        "warmups": WARMUPS,
         "lengths": LENGTHS,
         "torch_num_threads": TORCH_NUM_THREADS,
         "torch_num_interop_threads": TORCH_NUM_INTEROP_THREADS,
@@ -189,6 +200,7 @@ def main() -> None:
             ccm=ccm,
             length=length,
             attempts=ATTEMPTS,
+            warmups=WARMUPS,
             base_seed=SEED + idx * 10_000,
         )
         print(

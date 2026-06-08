@@ -18,7 +18,7 @@ from benchmark_report import update_report_section
 DEVICE = "cpu"
 DTYPE = "float32"
 METHOD = "simplex"
-MEMORY_BUDGET_GB = 4.0
+MEMORY_BUDGET_GB = 16.0
 XTWX_PRECOMPUTE = True
 XTWY_PRECOMPUTE = False
 TP = 0
@@ -29,6 +29,7 @@ LIBRARY_SIZE: int | str | None = None
 SAMPLE_SIZE: int | str | None = None
 BATCH_SIZE: int | str | None = "auto"
 ATTEMPTS = 3
+WARMUPS = 1
 SEED = 12345
 
 BENCHMARK_CASES: list[tuple[int, int, int]] = [
@@ -127,10 +128,16 @@ def generate_random_embeddings(
     return x_emb, y_emb
 
 
+def synchronize_device(device: str) -> None:
+    if device.startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
 def run_case(
     ccm: PairwiseCCM,
     case: BenchmarkCase,
     attempts: int,
+    warmups: int,
     base_seed: int,
 ) -> dict[str, float | int]:
     valid_points = case.ts_length - TP
@@ -144,7 +151,7 @@ def run_case(
     exclusion_window = resolve_exclusion_window(case, library_size)
     timings: list[float] = []
 
-    for attempt in range(attempts):
+    for attempt in range(warmups + attempts):
         rng = np.random.default_rng(base_seed + attempt)
         x_emb, y_emb = generate_random_embeddings(
             rng=rng,
@@ -154,6 +161,7 @@ def run_case(
             ex=case.ex,
         )
 
+        synchronize_device(ccm.device)
         t0 = time.perf_counter()
         _ = ccm.score_matrix(
             X_emb=x_emb,
@@ -166,10 +174,13 @@ def run_case(
             xtwx_precompute=XTWX_PRECOMPUTE,
             xtwy_precompute=XTWY_PRECOMPUTE,
             batch_size=BATCH_SIZE,
+            target_batch_size=None,
             seed=base_seed + attempt,
             clean_after=False,
         )
-        timings.append(time.perf_counter() - t0)
+        synchronize_device(ccm.device)
+        if attempt >= warmups:
+            timings.append(time.perf_counter() - t0)
 
     return {
         "n_x": case.n_x,
@@ -209,6 +220,7 @@ def main() -> None:
         "xtwx_precompute": XTWX_PRECOMPUTE,
         "xtwy_precompute": XTWY_PRECOMPUTE,
         "attempts": ATTEMPTS,
+        "warmups": WARMUPS,
         "benchmark_cases": BENCHMARK_CASES,
         "x_embedding_dim": X_EMBEDDING_DIM,
         "torch_num_threads": TORCH_NUM_THREADS,
@@ -244,6 +256,7 @@ def main() -> None:
             ccm=ccm,
             case=case,
             attempts=ATTEMPTS,
+            warmups=WARMUPS,
             base_seed=SEED + idx * 1000,
         )
         print(

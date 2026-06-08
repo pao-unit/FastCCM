@@ -8,31 +8,32 @@ Latest benchmark snapshots written directly by the scripts in this folder.
 Source: `benchmark_performance.py`
 
 Settings:
-- `device`: `cpu`
+- `device`: `cuda`
 - `dtype`: `float32`
-- `method`: `smap`
+- `method`: `simplex`
 - `tp`: `0`
 - `exclusion_window`: `5`
 - `library_size`: `all points`
 - `sample_size`: `all points`
 - `batch_size`: `auto`
-- `memory_budget_gb`: `4.0`
+- `memory_budget_gb`: `16.0`
 - `xtwx_precompute`: `True`
 - `xtwy_precompute`: `False`
 - `attempts`: `3`
+- `warmups`: `1`
 - `matrix_time_pairs`: `[(100, 1000), (200, 1000), (800, 500), (100, 8000)]`
 - `x_embedding_dim`: `5`
-- `torch_num_threads`: `10`
+- `torch_num_threads`: `32`
 - `torch_num_interop_threads`: `1`
 
 Results:
 
 | matrix_size | ts_length | ex | ey | library_size | sample_size | exclusion_window | attempts | avg_sec | min_sec | max_sec |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 100 | 1000 | 5 | 1 | 1000 | 1000 | 5 | 3 | 0.472770 | 0.457362 | 0.502851 |
-| 200 | 1000 | 5 | 1 | 1000 | 1000 | 5 | 3 | 1.165060 | 1.151663 | 1.188444 |
-| 800 | 500 | 5 | 1 | 500 | 500 | 5 | 3 | 5.730210 | 5.708630 | 5.753886 |
-| 100 | 8000 | 5 | 1 | 8000 | 8000 | 5 | 3 | 12.070288 | 12.056537 | 12.080152 |
+| 100 | 1000 | 5 | 1 | 1000 | 1000 | 5 | 3 | 0.023427 | 0.022992 | 0.023930 |
+| 200 | 1000 | 5 | 1 | 1000 | 1000 | 5 | 3 | 0.045167 | 0.043536 | 0.046919 |
+| 800 | 500 | 5 | 1 | 500 | 500 | 5 | 3 | 0.149560 | 0.147257 | 0.152447 |
+| 100 | 8000 | 5 | 1 | 8000 | 8000 | 5 | 3 | 0.255305 | 0.254659 | 0.256351 |
 <!-- benchmark-report:matrix-performance end -->
 
 <!-- benchmark-report:flat-arrays start -->
@@ -42,7 +43,7 @@ Source: `benchmark_flat_arrays.py`
 
 Settings:
 - `scenario`: `flat_arrays`
-- `device`: `cpu`
+- `device`: `cuda`
 - `dtype`: `float32`
 - `method`: `simplex`
 - `tp`: `0`
@@ -50,10 +51,11 @@ Settings:
 - `library_size`: `all points`
 - `sample_size`: `all points`
 - `batch_size`: `auto`
-- `memory_budget_gb`: `4.0`
+- `memory_budget_gb`: `16.0`
 - `xtwx_precompute`: `True`
 - `xtwy_precompute`: `False`
 - `attempts`: `3`
+- `warmups`: `1`
 - `benchmark_cases`: `[(1000, 1, 1000), (5000, 1, 1000), (20000, 1, 1000), (20000, 1, 2000), (1, 1000, 1000), (1, 5000, 1000), (1, 20000, 1000), (1, 20000, 2000)]`
 - `x_embedding_dim`: `5`
 - `torch_num_threads`: `10`
@@ -63,14 +65,14 @@ Results:
 
 | n_x | n_y | ts_length | ex | ey | library_size | sample_size | exclusion_window | attempts | avg_sec | min_sec | max_sec |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 1000 | 1 | 1000 | 5 | 1 | 1000 | 1000 | 5 | 3 | 0.648425 | 0.641460 | 0.653231 |
-| 5000 | 1 | 1000 | 5 | 1 | 1000 | 1000 | 5 | 3 | 3.459543 | 3.441733 | 3.491725 |
-| 20000 | 1 | 1000 | 5 | 1 | 1000 | 1000 | 5 | 3 | 17.174502 | 17.111393 | 17.298219 |
-| 20000 | 1 | 2000 | 5 | 1 | 2000 | 2000 | 5 | 3 | 83.950033 | 82.600801 | 84.807433 |
-| 1 | 1000 | 1000 | 5 | 1 | 1000 | 1000 | 5 | 3 | 0.024962 | 0.022869 | 0.028580 |
-| 1 | 5000 | 1000 | 5 | 1 | 1000 | 1000 | 5 | 3 | 0.098900 | 0.096482 | 0.102617 |
-| 1 | 20000 | 1000 | 5 | 1 | 1000 | 1000 | 5 | 3 | 0.388709 | 0.382346 | 0.394051 |
-| 1 | 20000 | 2000 | 5 | 1 | 2000 | 2000 | 5 | 3 | 0.498684 | 0.490984 | 0.507839 |
+| 1000 | 1 | 1000 | 5 | 1 | 1000 | 1000 | 5 | 3 | 0.076025 | 0.071962 | 0.078860 |
+| 5000 | 1 | 1000 | 5 | 1 | 1000 | 1000 | 5 | 3 | 0.397972 | 0.389591 | 0.410001 |
+| 20000 | 1 | 1000 | 5 | 1 | 1000 | 1000 | 5 | 3 | 1.583048 | 1.540807 | 1.641421 |
+| 20000 | 1 | 2000 | 5 | 1 | 2000 | 2000 | 5 | 3 | 4.555152 | 4.530931 | 4.567946 |
+| 1 | 1000 | 1000 | 5 | 1 | 1000 | 1000 | 5 | 3 | 0.013020 | 0.012322 | 0.013565 |
+| 1 | 5000 | 1000 | 5 | 1 | 1000 | 1000 | 5 | 3 | 0.047323 | 0.045840 | 0.048956 |
+| 1 | 20000 | 1000 | 5 | 1 | 1000 | 1000 | 5 | 3 | 0.184619 | 0.176933 | 0.191249 |
+| 1 | 20000 | 2000 | 5 | 1 | 2000 | 2000 | 5 | 3 | 0.272983 | 0.258270 | 0.286246 |
 <!-- benchmark-report:flat-arrays end -->
 
 <!-- benchmark-report:single-series start -->
@@ -80,7 +82,7 @@ Source: `benchmark_single_series_self_prediction.py`
 
 Settings:
 - `scenario`: `single-series self-prediction`
-- `device`: `cpu`
+- `device`: `cuda`
 - `dtype`: `float32`
 - `method`: `simplex`
 - `E`: `20`
@@ -90,22 +92,22 @@ Settings:
 - `library_size`: `all valid points`
 - `sample_size`: `all valid points`
 - `batch_size`: `auto`
-- `memory_budget_gb`: `4.0`
+- `memory_budget_gb`: `16.0`
 - `xtwx_precompute`: `True`
 - `xtwy_precompute`: `True`
 - `attempts`: `3`
 - `lengths`: `[2000, 8000, 32000, 128000]`
-- `torch_num_threads`: `8`
+- `torch_num_threads`: `32`
 - `torch_num_interop_threads`: `1`
 
 Results:
 
 | length | embedded_length | library_size | sample_size | exclusion_window | attempts | avg_sec | min_sec | max_sec |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 2000 | 1981 | 1980 | 1980 | 10 | 3 | 0.005502 | 0.004300 | 0.007584 |
-| 8000 | 7981 | 7980 | 7980 | 10 | 3 | 0.046544 | 0.043761 | 0.052031 |
-| 32000 | 31981 | 31980 | 31980 | 10 | 3 | 0.692234 | 0.679155 | 0.700298 |
-| 128000 | 127981 | 127980 | 127980 | 10 | 3 | 11.493153 | 11.473183 | 11.510613 |
+| 2000 | 1981 | 1980 | 1980 | 10 | 3 | 0.434323 | 0.004815 | 1.293321 |
+| 8000 | 7981 | 7980 | 7980 | 10 | 3 | 0.008351 | 0.007528 | 0.009386 |
+| 32000 | 31981 | 31980 | 31980 | 10 | 3 | 0.053833 | 0.049815 | 0.058614 |
+| 128000 | 127981 | 127980 | 127980 | 10 | 3 | 0.746251 | 0.743465 | 0.751764 |
 <!-- benchmark-report:single-series end -->
 
 <!-- benchmark-report:cpu-usage start -->

@@ -1,6 +1,7 @@
 # ccm.py
 import warnings
 import os
+import numpy as np
 import torch
 from .utils.metrics import (
     get_metric,
@@ -218,7 +219,8 @@ class PairwiseCCM:
         target_batch_size : {int, None, "auto"}, optional (simplex only)
             Number of target series (`n_Y`) processed per simplex reduction chunk.
             `None` keeps the original all-targets-at-once path, while
-            `"auto"` applies a deterministic offline-calibrated policy.
+            `"auto"` applies a device-aware policy: unsplit on CUDA, calibrated
+            chunking on CPU.
             When this argument is omitted, the auto policy is used by default.
         theta : float, optional (smap only)
             Local weighting strength; larger values induce steeper locality.
@@ -354,7 +356,8 @@ class PairwiseCCM:
         target_batch_size : {int, None, "auto"}, optional (simplex only)
             Number of target series (`n_Y`) processed per simplex reduction chunk.
             `None` keeps the original all-targets-at-once path, while
-            `"auto"` applies a deterministic offline-calibrated policy.
+            `"auto"` applies a device-aware policy: unsplit on CUDA, calibrated
+            chunking on CPU.
             When this argument is omitted, the auto policy is used by default.
         theta : float, optional (smap only)
             Local weighting strength; larger values induce steeper locality.
@@ -766,7 +769,7 @@ class PairwiseCCM:
         stream_state = None
         if stream_kind is not None:
             stream_state = stream_metric_state_init(
-                stream_kind, max_E_Y, num_ts_Y, num_ts_X, device="cpu", dtype=self.compute_dtype
+                stream_kind, max_E_Y, num_ts_Y, num_ts_X, device=self.device, dtype=self.compute_dtype
             )
 
         # Keep full output off accelerator in score mode so device memory tracks batch size.
@@ -825,7 +828,7 @@ class PairwiseCCM:
             Y_sample_batch_view = None
             if stream_kind is not None:
                 Y_sample_batch_view = Y_sample_shifted[:, s0:s1, :].permute(1, 2, 0).to(
-                    device="cpu", dtype=self.compute_dtype
+                    device=self.device, dtype=self.compute_dtype
                 ).contiguous()
             gather_ms = 0.0
             weighted_avg_ms = 0.0
@@ -875,7 +878,7 @@ class PairwiseCCM:
                     stream_metric_state_update(
                         stream_kind,
                         stream_state,
-                        A_y.to(device="cpu", dtype=self.compute_dtype),
+                        A_y.to(device=self.device, dtype=self.compute_dtype),
                         B_y,
                         y_start=y0,
                         count_samples=(y0 == 0),
@@ -945,7 +948,7 @@ class PairwiseCCM:
         stream_state = None
         if stream_kind is not None:
             stream_state = stream_metric_state_init(
-                stream_kind, max_E_Y, num_ts_Y, num_ts_X, device="cpu", dtype=self.compute_dtype
+                stream_kind, max_E_Y, num_ts_Y, num_ts_X, device=self.device, dtype=self.compute_dtype
             )
 
         # Keep full output off accelerator in score mode so device memory tracks batch size.
@@ -1077,12 +1080,12 @@ class PairwiseCCM:
                 A = pred_flat.view(num_ts_X, B, num_ts_Y, max_E_Y).permute(1, 3, 2, 0)  # (B,Ey,nY,nX)
                 if stream_kind is not None:
                     with time_block(self.logger, self.device, timings, "metric"):
-                        B_blk = torch.permute(Y_sample_shifted[:, s0:s1, :], (1, 2, 0)).to(device="cpu", dtype=self.compute_dtype)[:, :, :, None] \
+                        B_blk = torch.permute(Y_sample_shifted[:, s0:s1, :], (1, 2, 0)).to(device=self.device, dtype=self.compute_dtype)[:, :, :, None] \
                             .expand(B, max_E_Y, num_ts_Y, num_ts_X)
                         stream_metric_state_update(
                             stream_kind,
                             stream_state,
-                            A.to(device="cpu", dtype=self.compute_dtype),
+                            A.to(device=self.device, dtype=self.compute_dtype),
                             B_blk,
                         )
                         del B_blk
@@ -1134,6 +1137,26 @@ class PairwiseCCM:
 
 
     def __get_random_sample(self, X, min_len, indices, dim, max_E):
+        if dim > 0 and self.__can_stack_sample_block(X, min_len, max_E):
+            if isinstance(X, torch.Tensor):
+                stacked = X[:, -min_len:, :].to(device=self.device, dtype=self.dtype, copy=False)
+            elif isinstance(X, np.ndarray):
+                stacked = torch.as_tensor(X[:, -min_len:, :], device=self.device, dtype=self.dtype)
+            else:
+                first = X[0]
+                if isinstance(first, torch.Tensor):
+                    stacked = torch.stack(
+                        [Xi[-min_len:] for Xi in X],
+                        dim=0,
+                    ).to(device=self.device, dtype=self.dtype, copy=False)
+                else:
+                    stacked_np = np.stack(
+                        [np.asarray(Xi[-min_len:]) for Xi in X],
+                        axis=0,
+                    )
+                    stacked = torch.as_tensor(stacked_np, device=self.device, dtype=self.dtype)
+            return torch.index_select(stacked, 1, indices)
+
         X_buf = torch.zeros((dim, indices.shape[0], max_E),device=self.device, dtype=self.dtype)
 
         for i in range(dim):
@@ -1145,6 +1168,34 @@ class PairwiseCCM:
             X_buf[i, :, :X[i].shape[-1]] = Xi[indices]
 
         return X_buf
+
+    def __can_stack_sample_block(self, X, min_len, max_E):
+        if len(X) == 0:
+            return False
+        if isinstance(X, torch.Tensor) or isinstance(X, np.ndarray):
+            if X.ndim != 3:
+                return False
+            return (
+                int(X.shape[0]) > 0 and
+                int(X.shape[1]) >= int(min_len) and
+                int(X.shape[2]) == int(max_E)
+            )
+        first = X[0]
+        first_is_tensor = isinstance(first, torch.Tensor)
+        first_width = int(first.shape[-1])
+        if first_width != int(max_E):
+            return False
+        if int(first.shape[0]) < int(min_len):
+            return False
+
+        for Xi in X[1:]:
+            if isinstance(Xi, torch.Tensor) != first_is_tensor:
+                return False
+            if int(Xi.shape[-1]) != first_width:
+                return False
+            if int(Xi.shape[0]) < int(min_len):
+                return False
+        return True
 
     def __global_linear_output(
         self,
@@ -1185,7 +1236,7 @@ class PairwiseCCM:
         out = None
         if stream_kind is not None:
             stream_state = stream_metric_state_init(
-                stream_kind, max_E_Y, num_ts_Y, num_ts_X, device="cpu", dtype=compute_dtype
+                stream_kind, max_E_Y, num_ts_Y, num_ts_X, device=self.device, dtype=compute_dtype
             )
         else:
             out = torch.empty(
@@ -1201,7 +1252,7 @@ class PairwiseCCM:
             if stream_kind is not None:
                 A_blk = torch.empty(
                     (batch_queries, max_E_Y, num_ts_Y, num_ts_X),
-                    device="cpu",
+                    device=self.device,
                     dtype=compute_dtype,
                 )
 
@@ -1212,13 +1263,13 @@ class PairwiseCCM:
                 pred_flat = Xq @ beta_by_source[x_idx]
                 pred = pred_flat.view(batch_queries, num_ts_Y, max_E_Y).permute(0, 2, 1).contiguous()
                 if stream_kind is not None:
-                    A_blk[:, :, :, x_idx] = pred.to(device="cpu", dtype=compute_dtype)
+                    A_blk[:, :, :, x_idx] = pred.to(device=self.device, dtype=compute_dtype)
                 else:
                     out[s0:s1, :, :, x_idx] = pred.to(device=out_device, dtype=self.dtype)
 
             if stream_kind is not None:
                 B_blk = torch.permute(Y_sample_shifted[:, s0:s1, :], (1, 2, 0)).to(
-                    device="cpu", dtype=compute_dtype
+                    device=self.device, dtype=compute_dtype
                 )[:, :, :, None].expand(batch_queries, max_E_Y, num_ts_Y, num_ts_X)
                 stream_metric_state_update(stream_kind, stream_state, A_blk, B_blk)
 
@@ -1269,7 +1320,7 @@ class PairwiseCCM:
 
         if exclusion_rad is None:
             with time_block(self.logger, self.device, timings, "select"):
-                near_dist, indices = torch.topk(dist, n_nbrs_max, largest=False, sorted=True)
+                near_dist, indices = torch.topk(dist, n_nbrs_max, largest=False, sorted=False)
         else:
             with time_block(self.logger, self.device, timings, "select"):
                 allowed = (
@@ -1277,7 +1328,7 @@ class PairwiseCCM:
                     (lib_idx[None, :] < (sample_idx[:, None] - exclusion_rad))
                 )
                 dist.masked_fill_(~allowed.unsqueeze(0), float("inf"))
-                near_dist, indices = torch.topk(dist, n_nbrs_max, largest=False, sorted=True)
+                near_dist, indices = torch.topk(dist, n_nbrs_max, largest=False, sorted=False)
 
         with time_block(self.logger, self.device, timings, "weights"):
             weights, indices = self.__weights_from_dists(near_dist, indices, n_nbrs, n_nbrs_max)
