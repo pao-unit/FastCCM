@@ -8,7 +8,7 @@ Latest benchmark snapshots written directly by the scripts in this folder.
 Source: `benchmark_performance.py`
 
 Settings:
-- `device`: `cuda`
+- `device`: `cpu`
 - `dtype`: `float32`
 - `method`: `simplex`
 - `tp`: `0`
@@ -16,24 +16,24 @@ Settings:
 - `library_size`: `all points`
 - `sample_size`: `all points`
 - `batch_size`: `auto`
-- `memory_budget_gb`: `16.0`
+- `memory_budget_gb`: `10.0`
 - `xtwx_precompute`: `True`
 - `xtwy_precompute`: `False`
 - `attempts`: `3`
 - `warmups`: `1`
 - `matrix_time_pairs`: `[(100, 1000), (200, 1000), (800, 500), (100, 8000)]`
 - `x_embedding_dim`: `5`
-- `torch_num_threads`: `32`
+- `torch_num_threads`: `10`
 - `torch_num_interop_threads`: `1`
 
 Results:
 
 | matrix_size | ts_length | ex | ey | library_size | sample_size | exclusion_window | attempts | avg_sec | min_sec | max_sec |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 100 | 1000 | 5 | 1 | 1000 | 1000 | 5 | 3 | 0.023427 | 0.022992 | 0.023930 |
-| 200 | 1000 | 5 | 1 | 1000 | 1000 | 5 | 3 | 0.045167 | 0.043536 | 0.046919 |
-| 800 | 500 | 5 | 1 | 500 | 500 | 5 | 3 | 0.149560 | 0.147257 | 0.152447 |
-| 100 | 8000 | 5 | 1 | 8000 | 8000 | 5 | 3 | 0.255305 | 0.254659 | 0.256351 |
+| 100 | 1000 | 5 | 1 | 1000 | 1000 | 5 | 3 | 0.081379 | 0.078899 | 0.082828 |
+| 200 | 1000 | 5 | 1 | 1000 | 1000 | 5 | 3 | 0.197066 | 0.193971 | 0.201804 |
+| 800 | 500 | 5 | 1 | 500 | 500 | 5 | 3 | 1.258149 | 1.250663 | 1.270878 |
+| 100 | 8000 | 5 | 1 | 8000 | 8000 | 5 | 3 | 3.674799 | 3.663240 | 3.681893 |
 <!-- benchmark-report:matrix-performance end -->
 
 <!-- benchmark-report:flat-arrays start -->
@@ -82,9 +82,9 @@ Source: `benchmark_single_series_self_prediction.py`
 
 Settings:
 - `scenario`: `single-series self-prediction`
-- `device`: `cuda`
+- `device`: `cpu`
 - `dtype`: `float32`
-- `method`: `simplex`
+- `method`: `smap`
 - `E`: `20`
 - `tau`: `1`
 - `tp`: `1`
@@ -92,22 +92,23 @@ Settings:
 - `library_size`: `all valid points`
 - `sample_size`: `all valid points`
 - `batch_size`: `auto`
-- `memory_budget_gb`: `16.0`
+- `memory_budget_gb`: `10.0`
 - `xtwx_precompute`: `True`
 - `xtwy_precompute`: `True`
 - `attempts`: `3`
+- `warmups`: `1`
 - `lengths`: `[2000, 8000, 32000, 128000]`
-- `torch_num_threads`: `32`
+- `torch_num_threads`: `10`
 - `torch_num_interop_threads`: `1`
 
 Results:
 
 | length | embedded_length | library_size | sample_size | exclusion_window | attempts | avg_sec | min_sec | max_sec |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 2000 | 1981 | 1980 | 1980 | 10 | 3 | 0.434323 | 0.004815 | 1.293321 |
-| 8000 | 7981 | 7980 | 7980 | 10 | 3 | 0.008351 | 0.007528 | 0.009386 |
-| 32000 | 31981 | 31980 | 31980 | 10 | 3 | 0.053833 | 0.049815 | 0.058614 |
-| 128000 | 127981 | 127980 | 127980 | 10 | 3 | 0.746251 | 0.743465 | 0.751764 |
+| 2000 | 1981 | 1980 | 1980 | 10 | 3 | 0.008476 | 0.008368 | 0.008595 |
+| 8000 | 7981 | 7980 | 7980 | 10 | 3 | 0.081215 | 0.079113 | 0.082616 |
+| 32000 | 31981 | 31980 | 31980 | 10 | 3 | 1.344586 | 1.308495 | 1.379943 |
+| 128000 | 127981 | 127980 | 127980 | 10 | 3 | 20.603830 | 20.431385 | 20.848301 |
 <!-- benchmark-report:single-series end -->
 
 <!-- benchmark-report:cpu-usage start -->

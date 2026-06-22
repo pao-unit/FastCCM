@@ -15,10 +15,10 @@ import torch
 
 from benchmark_report import update_report_section
 
-DEVICE = "cuda"
+DEVICE = "cpu"
 DTYPE = "float32"
 METHOD = "simplex"
-MEMORY_BUDGET_GB = 16.0
+MEMORY_BUDGET_GB = 10.0
 XTWX_PRECOMPUTE = True
 XTWY_PRECOMPUTE = False
 TP = 0
@@ -41,7 +41,7 @@ MATRIX_TIME_PAIRS: list[tuple[int, int]] = [
 TORCH_NUM_THREADS = int(
     os.environ.get(
         "FASTCCM_TORCH_NUM_THREADS",
-        os.environ.get("TORCH_NUM_THREADS", min(os.cpu_count() or 1, 32)),
+        os.environ.get("TORCH_NUM_THREADS", min(os.cpu_count() or 1, 10)),
     )
 )
 TORCH_NUM_INTEROP_THREADS = int(
@@ -166,7 +166,7 @@ def run_case(
             xtwx_precompute=XTWX_PRECOMPUTE,
             xtwy_precompute=XTWY_PRECOMPUTE,
             batch_size=BATCH_SIZE,
-            target_batch_size=None,
+            target_batch_size="auto",
             seed=base_seed + attempt,
             clean_after=False
         )

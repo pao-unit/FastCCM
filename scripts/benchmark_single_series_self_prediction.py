@@ -14,10 +14,10 @@ import torch
 
 from benchmark_report import update_report_section
 
-DEVICE = "cuda"
+DEVICE = "cpu"
 DTYPE = "float32"
-METHOD = "simplex"
-MEMORY_BUDGET_GB = 16.0
+METHOD = "smap"
+MEMORY_BUDGET_GB = 10.0
 XTWX_PRECOMPUTE = True
 XTWY_PRECOMPUTE = True
 EMBED_DIM = 20
@@ -34,7 +34,7 @@ SEED = 12345
 TORCH_NUM_THREADS = int(
     os.environ.get(
         "FASTCCM_TORCH_NUM_THREADS",
-        os.environ.get("TORCH_NUM_THREADS", min(os.cpu_count() or 1, 32)),
+        os.environ.get("TORCH_NUM_THREADS", min(os.cpu_count() or 1, 10)),
     )
 )
 TORCH_NUM_INTEROP_THREADS = int(
