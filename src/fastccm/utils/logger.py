@@ -48,9 +48,17 @@ def setup_logger(name: str, verbose: int = 0, log_file: str = None) -> logging.L
 
     level = logging.WARNING if verbose <= 0 else (logging.INFO if verbose == 1 else logging.DEBUG)
     logger.setLevel(level)
+    configured_log_file = getattr(logger, "_pairwiseccm_log_file", None)
+    configured = getattr(logger, "_pairwiseccm_configured", False)
+    if configured and configured_log_file != log_file:
+        for h in list(logger.handlers):
+            logger.removeHandler(h)
+            h.close()
+        logger._pairwiseccm_configured = False
+        configured = False
 
     # Avoid duplicate handlers across multiple PairwiseCCM instances.
-    if not getattr(logger, "_pairwiseccm_configured", False):
+    if not configured:
         logger.propagate = False
 
         fmt = MicrosecondFormatter(
@@ -64,6 +72,7 @@ def setup_logger(name: str, verbose: int = 0, log_file: str = None) -> logging.L
         logger.addHandler(handler)
 
         logger._pairwiseccm_configured = True
+        logger._pairwiseccm_log_file = log_file
     else:
         # Update handler levels when verbose changes.
         for h in logger.handlers:

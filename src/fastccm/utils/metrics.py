@@ -5,6 +5,8 @@ import torch
 
 # All metrics take A,B with shape [S, D, Y, X] and return [D, Y, X]
 Metric = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+# CPU matrix sweeps show the centered block merger paying off at this scale.
+_CORR_CENTERED_MIN_SOURCES = 512
 
 
 def _corr_accum_dtype(dtype: torch.dtype, device) -> torch.dtype:
@@ -141,7 +143,7 @@ def get_streaming_metric_kind(metric_fn) -> Optional[str]:
     }.get(name)
 
 
-def stream_metric_state_init(kind: str, D, Y, X, *, device, dtype):
+def stream_metric_state_init(kind: str, D, Y, X, *, device, dtype, shared_target: bool = False):
     shape_dyx = (D, Y, X)
     out_dtype = dtype
     acc_dtype = _corr_accum_dtype(dtype, device) if kind == "corr" else dtype
@@ -152,16 +154,30 @@ def stream_metric_state_init(kind: str, D, Y, X, *, device, dtype):
         "dtype": out_dtype,
         "acc_dtype": acc_dtype,
         "device": device,
+        "shared_target": bool(shared_target),
     }
 
     if kind == "corr":
-        state.update({
-            "sumA": z_dyx.clone(),
-            "sumB": z_dyx.clone(),
-            "sumAA": z_dyx.clone(),
-            "sumBB": z_dyx.clone(),
-            "sumAB": z_dyx.clone(),
-        })
+        target_x = 1 if shared_target else X
+        z_dyb = torch.zeros((D, Y, target_x), device=device, dtype=acc_dtype)
+        centered = acc_dtype != dtype and int(X) >= _CORR_CENTERED_MIN_SOURCES
+        state["corr_centered"] = centered
+        if centered:
+            state.update({
+                "meanA": z_dyx.clone(),
+                "meanB": z_dyb.clone(),
+                "m2A": z_dyx.clone(),
+                "m2B": z_dyb.clone(),
+                "coAB": z_dyx.clone(),
+            })
+        else:
+            state.update({
+                "sumA": z_dyx.clone(),
+                "sumB": z_dyb.clone(),
+                "sumAA": z_dyx.clone(),
+                "sumBB": z_dyb.clone(),
+                "sumAB": z_dyx.clone(),
+            })
         return state
     if kind in ("mse", "rmse"):
         state["sum_sq_err"] = z_dyx
@@ -172,10 +188,12 @@ def stream_metric_state_init(kind: str, D, Y, X, *, device, dtype):
     if kind == "neg_nrmse":
         shape_yx = (Y, X)
         z_yx = torch.zeros(shape_yx, device=device, dtype=dtype)
+        target_x = 1 if shared_target else X
+        z_yb = torch.zeros((Y, target_x), device=device, dtype=dtype)
         state.update({
             "sum_sq_err_sd": z_yx.clone(),  # over S and D
-            "sumB_sd": z_yx.clone(),        # over S and D
-            "sumBB_sd": z_yx.clone(),       # over S and D
+            "sumB_sd": z_yb.clone(),        # over S and D
+            "sumBB_sd": z_yb.clone(),       # over S and D
         })
         return state
     raise ValueError(f"Unsupported streaming metric kind: {kind}")
@@ -186,16 +204,65 @@ def stream_metric_state_update(kind: str, state, A_blk, B_blk, *, y_start: int =
         state["n"] += int(A_blk.shape[0])
     y_stop = int(y_start + A_blk.shape[2])
     dyx = (slice(None), slice(int(y_start), y_stop), slice(None))
+    dy1 = (slice(None), slice(int(y_start), y_stop), slice(None))
     yx = (slice(int(y_start), y_stop), slice(None))
+    y1 = (slice(int(y_start), y_stop), slice(None))
 
     if kind == "corr":
-        A_blk = A_blk.to(device=state["device"], dtype=state["acc_dtype"])
-        B_blk = B_blk.to(device=state["device"], dtype=state["acc_dtype"])
-        state["sumA"][dyx] += A_blk.sum(dim=0)
-        state["sumB"][dyx] += B_blk.sum(dim=0)
-        state["sumAA"][dyx] += (A_blk * A_blk).sum(dim=0)
-        state["sumBB"][dyx] += (B_blk * B_blk).sum(dim=0)
-        state["sumAB"][dyx] += (A_blk * B_blk).sum(dim=0)
+        if state.get("shared_target", False):
+            B_blk = B_blk[..., :1]
+        if state.get("corr_centered", False):
+            # Center in float32, then merge only reduced summaries in float64.
+            # This avoids a full promoted prediction tile without sacrificing
+            # stability across sample batches with different means.
+            work_dtype = (
+                torch.float32
+                if A_blk.dtype in (torch.float16, torch.bfloat16)
+                else A_blk.dtype
+            )
+            A_work = A_blk.to(dtype=work_dtype)
+            B_work = B_blk.to(dtype=work_dtype)
+            anchorA = A_work[:1]
+            anchorB = B_work[:1]
+            deltaA_work = A_work - anchorA
+            deltaB_work = B_work - anchorB
+            mean_deltaA = deltaA_work.mean(dim=0)
+            mean_deltaB = deltaB_work.mean(dim=0)
+            centeredA = deltaA_work - mean_deltaA
+            centeredB = deltaB_work - mean_deltaB
+            m2A_blk = (centeredA * centeredA).sum(dim=0).to(state["acc_dtype"])
+            m2B_blk = (centeredB * centeredB).sum(dim=0).to(state["acc_dtype"])
+            coAB_blk = (centeredA * centeredB).sum(dim=0).to(state["acc_dtype"])
+            meanA_blk = anchorA[0].to(state["acc_dtype"]) + mean_deltaA.to(state["acc_dtype"])
+            meanB_blk = anchorB[0].to(state["acc_dtype"]) + mean_deltaB.to(state["acc_dtype"])
+
+            n_blk = int(A_blk.shape[0])
+            n_total = int(state["n"])
+            n_prev = n_total - n_blk
+            if n_prev <= 0:
+                state["meanA"][dyx].copy_(meanA_blk)
+                state["meanB"][dy1].copy_(meanB_blk)
+                state["m2A"][dyx].copy_(m2A_blk)
+                state["m2B"][dy1].copy_(m2B_blk)
+                state["coAB"][dyx].copy_(coAB_blk)
+            else:
+                merge_weight = float(n_blk) / float(n_total)
+                merge_factor = float(n_prev * n_blk) / float(n_total)
+                deltaA = meanA_blk - state["meanA"][dyx]
+                deltaB = meanB_blk - state["meanB"][dy1]
+                state["coAB"][dyx] += coAB_blk + deltaA * deltaB * merge_factor
+                state["m2A"][dyx] += m2A_blk + deltaA * deltaA * merge_factor
+                state["m2B"][dy1] += m2B_blk + deltaB * deltaB * merge_factor
+                state["meanA"][dyx] += deltaA * merge_weight
+                state["meanB"][dy1] += deltaB * merge_weight
+        else:
+            A_blk = A_blk.to(device=state["device"], dtype=state["acc_dtype"])
+            B_blk = B_blk.to(device=state["device"], dtype=state["acc_dtype"])
+            state["sumA"][dyx] += A_blk.sum(dim=0)
+            state["sumB"][dy1] += B_blk.sum(dim=0)
+            state["sumAA"][dyx] += (A_blk * A_blk).sum(dim=0)
+            state["sumBB"][dy1] += (B_blk * B_blk).sum(dim=0)
+            state["sumAB"][dyx] += (A_blk * B_blk).sum(dim=0)
         return
     if kind in ("mse", "rmse"):
         d = A_blk - B_blk
@@ -207,8 +274,10 @@ def stream_metric_state_update(kind: str, state, A_blk, B_blk, *, y_start: int =
     if kind == "neg_nrmse":
         d = A_blk - B_blk
         state["sum_sq_err_sd"][yx] += (d * d).sum(dim=(0, 1))
-        state["sumB_sd"][yx] += B_blk.sum(dim=(0, 1))
-        state["sumBB_sd"][yx] += (B_blk * B_blk).sum(dim=(0, 1))
+        if state.get("shared_target", False):
+            B_blk = B_blk[..., :1]
+        state["sumB_sd"][y1] += B_blk.sum(dim=(0, 1))
+        state["sumBB_sd"][y1] += (B_blk * B_blk).sum(dim=(0, 1))
         return
     raise ValueError(f"Unsupported streaming metric kind: {kind}")
 
@@ -223,9 +292,14 @@ def stream_metric_state_finalize(kind: str, state, *, eps=1e-12, neg_nrmse_T=0.5
     eps_t = torch.tensor(eps, device=device, dtype=acc_dtype)
 
     if kind == "corr":
-        num = state["sumAB"] - (state["sumA"] * state["sumB"] / n_t)
-        denA = state["sumAA"] - (state["sumA"] * state["sumA"] / n_t)
-        denB = state["sumBB"] - (state["sumB"] * state["sumB"] / n_t)
+        if state.get("corr_centered", False):
+            num = state["coAB"]
+            denA = state["m2A"]
+            denB = state["m2B"]
+        else:
+            num = state["sumAB"] - (state["sumA"] * state["sumB"] / n_t)
+            denA = state["sumAA"] - (state["sumA"] * state["sumA"] / n_t)
+            denB = state["sumBB"] - (state["sumB"] * state["sumB"] / n_t)
         den = torch.sqrt(denA.clamp_min(0.0) * denB.clamp_min(0.0) + eps_t)
         return (num / den).clamp(-1.0, 1.0).to(dtype=out_dtype)
     if kind == "mse":

@@ -148,12 +148,15 @@ def _simplex_base_bytes(
 # Deterministic simplex target auto-split constants calibrated from offline CPU
 # sweeps. The goal is to keep the gathered target tile near a stable working-set
 # size while falling back to a conservative `ny` chunk when search dominates.
-# Recent pairwise CPU sweeps favored keeping the auto policy in the 16-64 range
-# rather than dropping to 8-target chunks too eagerly.
+# Matrix-shaped CPU sweeps favor smaller tiles once reduction and streaming
+# metrics dominate neighbor search. A roughly 36 MiB gathered tile selects 16
+# targets for 100x100 work and 8 targets once the source axis reaches 512.
 SIMPLEX_SEARCH_SAFETY_FACTOR = 1.50
 SIMPLEX_REDUCE_SAFETY_FACTOR = 1.10
-SIMPLEX_CALIBRATED_TARGET_TILE_BYTES = 72 * 1024 * 1024
+SIMPLEX_CALIBRATED_TARGET_TILE_BYTES = 36 * 1024 * 1024
 SIMPLEX_CALIBRATED_TARGET_BATCH_MIN = 16
+SIMPLEX_CALIBRATED_LARGE_SOURCE_TARGET_BATCH_MIN = 8
+SIMPLEX_CALIBRATED_LARGE_SOURCE_THRESHOLD = 512
 SIMPLEX_CALIBRATED_TARGET_BATCH_MAX = 64
 SIMPLEX_CALIBRATED_SEARCH_DOMINANT_RATIO = 8.0
 SIMPLEX_CALIBRATED_SEARCH_DOMINANT_TARGET_BATCH = 32
@@ -217,7 +220,12 @@ def _calibrated_simplex_target_batch_size(
     K = int(nbrs_num_max)
     L = int(library_size)
 
-    if nY <= SIMPLEX_CALIBRATED_TARGET_BATCH_MIN:
+    target_batch_min = (
+        SIMPLEX_CALIBRATED_LARGE_SOURCE_TARGET_BATCH_MIN
+        if nX >= SIMPLEX_CALIBRATED_LARGE_SOURCE_THRESHOLD
+        else SIMPLEX_CALIBRATED_TARGET_BATCH_MIN
+    )
+    if nY <= target_batch_min:
         return nY
 
     cbytes = _dtype_bytes(compute_dtype)
@@ -249,7 +257,7 @@ def _calibrated_simplex_target_batch_size(
 
     available_bytes = int(budget_bytes) - int(base_bytes)
     if available_bytes <= 0:
-        return min(nY, SIMPLEX_CALIBRATED_TARGET_BATCH_MIN)
+        return min(nY, target_batch_min)
 
     # Use the search-dominated batch as the first fixed-point iterate, then set
     # `ny` so the gathered target tile stays near the calibrated working set.
@@ -258,7 +266,7 @@ def _calibrated_simplex_target_batch_size(
     target_by = float(SIMPLEX_CALIBRATED_TARGET_TILE_BYTES) / float(tile_unit_bytes)
     return _round_pow2_clamped(
         target_by,
-        min_value=min(SIMPLEX_CALIBRATED_TARGET_BATCH_MIN, nY),
+        min_value=min(target_batch_min, nY),
         max_value=min(SIMPLEX_CALIBRATED_TARGET_BATCH_MAX, nY),
     )
 

@@ -1193,7 +1193,13 @@ class PairwiseCCM:
         stream_state = None
         if stream_kind is not None:
             stream_state = stream_metric_state_init(
-                stream_kind, max_E_Y, num_ts_Y, num_ts_X, device=self.device, dtype=self.compute_dtype
+                stream_kind,
+                max_E_Y,
+                num_ts_Y,
+                num_ts_X,
+                device=self.device,
+                dtype=self.compute_dtype,
+                shared_target=True,
             )
 
         # Keep full output off accelerator in score mode so device memory tracks batch size.
