@@ -47,6 +47,24 @@ def _resolve_dtype(x):
         return dt
     raise ValueError(f"Unknown dtype: {x!r}")
 
+
+class _NeighborLibrary:
+    """
+    The library side of `torch.cdist(..., "use_mm_for_euclid_dist")`, hoisted out
+    of the query-batch loop.
+
+    That mode evaluates ||q-p|| as a single matmul of augmented operands,
+    [-2q, ||q||^2, 1] . [p, 1, ||p||^2]. The right-hand operand depends only on
+    the library, so it is built once per call instead of once per batch. The
+    arithmetic is unchanged, so results stay bit-for-bit identical to `cdist`.
+    """
+
+    __slots__ = ("augmented", "num_points")
+
+    def __init__(self, augmented, num_points):
+        self.augmented = augmented
+        self.num_points = int(num_points)
+
 class PairwiseCCM:
     """
     Pairwise Convergent Cross Mapping (CCM) in PyTorch.
@@ -102,6 +120,12 @@ class PairwiseCCM:
             raise ValueError("memory_budget_gb must be positive.")
         
         self.logger = setup_logger(__name__, verbose=verbose, log_file=log_file)
+
+        # Reusable flat buffers for the k-NN search, released by `clean_after`.
+        # `cdist` has no `out=`, so it allocates its (n_X, S, L) result every
+        # batch; on CPU the first-touch page faults on that block cost more than
+        # the matmul that fills it.
+        self._nbr_workspace = {}
 
     def _predict_warning_threshold_bytes(self) -> int:
         budget_bytes = max(1, int(self.memory_budget_gb * (1024 ** 3)))
@@ -279,6 +303,7 @@ class PairwiseCCM:
         r_AB = r_AB.to("cpu").numpy()
         self.logger.info("score_matrix completed with output shape %s", r_AB.shape)
         if clean_after:
+            self._release_nbr_workspace()
             soft_clear(self.logger, self.device)
         return r_AB
 
@@ -419,6 +444,7 @@ class PairwiseCCM:
         A = A.to("cpu").numpy()
         self.logger.info("predict_matrix completed with output shape %s", A.shape)
         if clean_after:
+            self._release_nbr_workspace()
             soft_clear(self.logger, self.device)
         return A
 
@@ -520,6 +546,7 @@ class PairwiseCCM:
         result_np = {key: value.to("cpu").numpy() for key, value in result.items()}
         self.logger.info("moran_matrix completed with output shape %s", result_np["I"].shape)
         if clean_after:
+            self._release_nbr_workspace()
             soft_clear(self.logger, self.device)
         return result_np
 
@@ -655,6 +682,7 @@ class PairwiseCCM:
             device=self.device,
             dtype=self.dtype,
         )
+        lib_index = self._prepare_nbr_library(X_nodes)
         for s0 in batch_starts(self.logger, graph_size, sample_batch_size, "moran graph batches"):
             s1 = min(graph_size, s0 + sample_batch_size)
             weights, indices = self.__get_nbrs_indices_with_weights(
@@ -665,6 +693,7 @@ class PairwiseCCM:
                 x_indices,
                 x_indices[s0:s1],
                 exclusion_window,
+                lib_index=lib_index,
             )
             neighbor_indices[:, s0:s1, :] = indices
             neighbor_weights[:, s0:s1, :] = weights
@@ -1175,6 +1204,8 @@ class PairwiseCCM:
 
         if nbrs_num_max is None:
             nbrs_num_max = int(nbrs_num.max().item())
+
+        lib_index = self._prepare_nbr_library(X_lib)
         self.logger.debug(
             "Entering simplex backend (queries=%d, library_points=%d, num_sources=%d, num_targets=%d, Ey=%d, nbrs_max=%d, batch_size=%d, num_batches=%d, target_batch_size=%d, num_target_batches=%d, exclusion=%s)",
             int(subsample_size),
@@ -1241,7 +1272,7 @@ class PairwiseCCM:
                     weights, indices = self.__get_nbrs_indices_with_weights(
                         X_lib, X_sample_b,
                         nbrs_num, nbrs_num_max, lib_indices, smpl_indices[s0:s1],
-                        exclusion_rad
+                        exclusion_rad, lib_index=lib_index
                     )
             except RuntimeError as e:
                 if is_oom_error(e):
@@ -1732,33 +1763,93 @@ class PairwiseCCM:
         return torch.cat([ones, X], dim=1)
 
     def __linear_compute_dtype(self):
+        return self._promoted_compute_dtype()
+
+    def _promoted_compute_dtype(self):
+        """compute_dtype, with fp16 promoted on CPU where it is slow and unstable."""
         if self.device.startswith("cpu") and self.compute_dtype == torch.float16:
             return torch.float32
         return self.compute_dtype
 
+    def _use_workspace_neighbors(self):
+        """
+        Whether to run the neighbor search through reusable buffers instead of
+        letting `cdist`/`topk` allocate per batch.
+
+        CPU only: the win is avoiding first-touch page faults on a result block
+        that is routinely hundreds of MB, which CUDA's caching allocator already
+        avoids. The distances are computed by the same expression `cdist` uses,
+        so either path returns identical values.
+        """
+        return self.device.startswith("cpu")
+
+    def _release_nbr_workspace(self):
+        self._nbr_workspace = {}
+
+    def __workspace(self, name, shape, dtype):
+        """Persistent flat buffer for `name`, viewed as `shape`."""
+        numel = 1
+        for dim in shape:
+            numel *= int(dim)
+        buf = self._nbr_workspace.get(name)
+        if buf is None or buf.numel() < numel or buf.dtype != dtype:
+            self._nbr_workspace.pop(name, None)
+            try:
+                buf = torch.empty(numel, device=self.device, dtype=dtype)
+            except RuntimeError as e:
+                if is_oom_error(e):
+                    self._nbr_workspace = {}
+                    hard_clear(self.logger, self.device)
+                raise
+            self._nbr_workspace[name] = buf
+        return buf[:numel].view(*shape)
+
+    def _prepare_nbr_library(self, lib):
+        """Build the library-side augmented operand once per call."""
+        if not self._use_workspace_neighbors():
+            return None
+        lib_c = self.__to_tensor(lib, dtype=self._promoted_compute_dtype())
+        sq = lib_c.pow(2).sum(-1, True)
+        pad = torch.ones_like(sq)
+        return _NeighborLibrary(torch.cat([lib_c, pad, sq], -1), lib_c.shape[1])
+
     def __get_nbrs_indices_with_weights(
-        self, lib, sample, n_nbrs, n_nbrs_max, lib_idx, sample_idx, exclusion_rad
+        self, lib, sample, n_nbrs, n_nbrs_max, lib_idx, sample_idx, exclusion_rad,
+        lib_index=None,
     ):
+        """
+        Weights and library indices of each query's k nearest neighbors.
+
+        Note: the returned tensors alias per-instance workspaces and stay valid
+        only until the next call, which both callers respect by consuming them
+        before advancing to the next query batch.
+        """
         timings = {}
         try:
             with time_block(self.logger, self.device, timings, "cdist"):
-                dist = self._cdist(sample, lib)  # (num_ts_X, S_blk, L)
+                if lib_index is None and self._use_workspace_neighbors():
+                    lib_index = self._prepare_nbr_library(lib)
+                if lib_index is None:
+                    dist = self._cdist(sample, lib)  # (num_ts_X, S_blk, L)
+                else:
+                    dist = self.__euclidean_dist(sample, lib_index)
         except RuntimeError as e:
             if is_oom_error(e):
                 hard_clear(self.logger, self.device)
             raise
 
-        if exclusion_rad is None:
-            with time_block(self.logger, self.device, timings, "select"):
+        with time_block(self.logger, self.device, timings, "select"):
+            if exclusion_rad is not None:
+                excluded = (lib_idx[None, :] - sample_idx[:, None]).abs() <= exclusion_rad
+                dist.masked_fill_(excluded.unsqueeze(0), float("inf"))
+            if lib_index is None:
                 near_dist, indices = torch.topk(dist, n_nbrs_max, largest=False, sorted=False)
-        else:
-            with time_block(self.logger, self.device, timings, "select"):
-                allowed = (
-                    (lib_idx[None, :] > (sample_idx[:, None] + exclusion_rad)) |
-                    (lib_idx[None, :] < (sample_idx[:, None] - exclusion_rad))
-                )
-                dist.masked_fill_(~allowed.unsqueeze(0), float("inf"))
-                near_dist, indices = torch.topk(dist, n_nbrs_max, largest=False, sorted=False)
+            else:
+                sel = (dist.shape[0], dist.shape[1], n_nbrs_max)
+                near_dist = self.__workspace("near_dist", sel, dist.dtype)
+                indices = self.__workspace("indices", sel, torch.long)
+                torch.topk(dist, n_nbrs_max, dim=2, largest=False, sorted=False,
+                           out=(near_dist, indices))
 
         with time_block(self.logger, self.device, timings, "weights"):
             weights, indices = self.__weights_from_dists(near_dist, indices, n_nbrs, n_nbrs_max)
@@ -1767,20 +1858,40 @@ class PairwiseCCM:
             timings["total"] = sum(v for v in timings.values())
             self.logger.debug("Neighbor search timings: %s", timings_summary(timings, ["cdist", "select", "weights", "total"]))
         return weights, indices
-    
+
+    def __euclidean_dist(self, sample, lib_index):
+        """
+        `cdist(..., "use_mm_for_euclid_dist")` written into a reusable buffer.
+
+        Mirrors ATen's expression exactly - augment both operands, one matmul,
+        clamp, sqrt - so the result is bit-for-bit what `cdist` returns; the only
+        difference is that the output block is reused across batches.
+        """
+        comp = self._promoted_compute_dtype()
+        q = self.__to_tensor(sample, dtype=comp)
+        sq = q.pow(2).sum(-1, True)
+        pad = torch.ones_like(sq)
+        augmented = torch.cat([q.mul(-2), sq, pad], -1)
+        dist = self.__workspace(
+            "dist", (q.shape[0], q.shape[1], lib_index.num_points), comp
+        )
+        torch.matmul(augmented, lib_index.augmented.mT, out=dist)
+        return dist.clamp_min_(0).sqrt_()
+
     def __weights_from_dists(self, near_dist, indices, n_nbrs, n_nbrs_max):
         timings = {}
         eps = torch.finfo(near_dist.dtype).eps
         with time_block(self.logger, self.device, timings, "exp"):
-            d0 = near_dist.min(dim=2, keepdim=True).values.clamp_min(eps)
-            #w  = torch.exp(-near_dist / d0)
-            #w  = torch.where(torch.isfinite(near_dist), w, torch.zeros_like(w))
-            w = torch.exp(-near_dist / d0)
+            d0 = near_dist.amin(dim=2, keepdim=True).clamp_min(eps)
+            w = near_dist.div(d0).neg_().exp_()
             w.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
 
         with time_block(self.logger, self.device, timings, "mask"):
-            keep = (torch.arange(n_nbrs_max, device=w.device).unsqueeze(0) < n_nbrs.unsqueeze(1))
-            w = w * keep[:, None, :].to(w.dtype)
+            # Uniform k (the default, nbrs_num = E_x + 1 over equal-width sources)
+            # keeps every column, so the mask is only built when it can drop one.
+            if int(n_nbrs.min()) < n_nbrs_max:
+                keep = (torch.arange(n_nbrs_max, device=w.device).unsqueeze(0) < n_nbrs.unsqueeze(1))
+                w.mul_(keep[:, None, :].to(w.dtype))
 
         with time_block(self.logger, self.device, timings, "normalize"):
             sumw = w.sum(dim=2, keepdim=True)
@@ -1791,8 +1902,7 @@ class PairwiseCCM:
                     "Reduce `exclusion_window`, increase `library_size`, or ensure the "
                     "library contains valid neighbors."
                 )
-            w = w / sumw.clamp_min(eps)
-            out = w.to(self.dtype)
+            out = w.div_(sumw.clamp_min(eps)).to(self.dtype)
 
         if self._debug_enabled():
             timings["total"] = sum(v for v in timings.values())
@@ -1820,9 +1930,7 @@ class PairwiseCCM:
         return weights
       
     def _cdist(self, a, b):
-        comp = self.compute_dtype
-        if self.device.startswith("cpu") and comp == torch.float16:
-            comp = torch.float32
+        comp = self._promoted_compute_dtype()
         try:
             a = self.__to_tensor(a, dtype=comp)
             b = self.__to_tensor(b, dtype=comp)
