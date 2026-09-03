@@ -55,8 +55,7 @@ class _NeighborLibrary:
 
     That mode evaluates ||q-p|| as a single matmul of augmented operands,
     [-2q, ||q||^2, 1] . [p, 1, ||p||^2]. The right-hand operand depends only on
-    the library, so it is built once per call instead of once per batch. The
-    arithmetic is unchanged, so results stay bit-for-bit identical to `cdist`.
+    the library, so it is built once per call instead of once per batch.
     """
 
     __slots__ = ("augmented", "num_points")
@@ -1776,12 +1775,12 @@ class PairwiseCCM:
         Whether to run the neighbor search through reusable buffers instead of
         letting `cdist`/`topk` allocate per batch.
 
-        CPU only: the win is avoiding first-touch page faults on a result block
-        that is routinely hundreds of MB, which CUDA's caching allocator already
-        avoids. The distances are computed by the same expression `cdist` uses,
-        so either path returns identical values.
+        CPU avoids first-touch page faults on large result blocks; CUDA avoids
+        rebuilding the library operand and reuses intermediate allocations across
+        query batches. MPS retains the native path because its `out=` support
+        differs from CPU and CUDA.
         """
-        return self.device.startswith("cpu")
+        return self.device.startswith(("cpu", "cuda"))
 
     def _release_nbr_workspace(self):
         self._nbr_workspace = {}
@@ -1832,7 +1831,7 @@ class PairwiseCCM:
                 if lib_index is None:
                     dist = self._cdist(sample, lib)  # (num_ts_X, S_blk, L)
                 else:
-                    dist = self.__euclidean_dist(sample, lib_index)
+                    dist = self.__squared_euclidean_dist(sample, lib_index)
         except RuntimeError as e:
             if is_oom_error(e):
                 hard_clear(self.logger, self.device)
@@ -1850,6 +1849,7 @@ class PairwiseCCM:
                 indices = self.__workspace("indices", sel, torch.long)
                 torch.topk(dist, n_nbrs_max, dim=2, largest=False, sorted=False,
                            out=(near_dist, indices))
+                near_dist.sqrt_()
 
         with time_block(self.logger, self.device, timings, "weights"):
             weights, indices = self.__weights_from_dists(near_dist, indices, n_nbrs, n_nbrs_max)
@@ -1859,13 +1859,13 @@ class PairwiseCCM:
             self.logger.debug("Neighbor search timings: %s", timings_summary(timings, ["cdist", "select", "weights", "total"]))
         return weights, indices
 
-    def __euclidean_dist(self, sample, lib_index):
+    def __squared_euclidean_dist(self, sample, lib_index):
         """
-        `cdist(..., "use_mm_for_euclid_dist")` written into a reusable buffer.
+        Squared `cdist(..., "use_mm_for_euclid_dist")` in a reusable buffer.
 
-        Mirrors ATen's expression exactly - augment both operands, one matmul,
-        clamp, sqrt - so the result is bit-for-bit what `cdist` returns; the only
-        difference is that the output block is reused across batches.
+        Rank squared distances and apply the monotonic square root only to the
+        selected neighbors. Distances that become equal only after float32 sqrt
+        rounding can select a different tied neighbor than the native path.
         """
         comp = self._promoted_compute_dtype()
         q = self.__to_tensor(sample, dtype=comp)
@@ -1876,7 +1876,7 @@ class PairwiseCCM:
             "dist", (q.shape[0], q.shape[1], lib_index.num_points), comp
         )
         torch.matmul(augmented, lib_index.augmented.mT, out=dist)
-        return dist.clamp_min_(0).sqrt_()
+        return dist.clamp_min_(0)
 
     def __weights_from_dists(self, near_dist, indices, n_nbrs, n_nbrs_max):
         timings = {}

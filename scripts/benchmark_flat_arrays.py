@@ -18,7 +18,7 @@ from benchmark_report import update_report_section
 DEVICE = "cpu"
 DTYPE = "float32"
 METHOD = "simplex"
-MEMORY_BUDGET_GB = 10.0
+MEMORY_BUDGET_GB = 16.0
 XTWX_PRECOMPUTE = True
 XTWY_PRECOMPUTE = False
 TP = 0
