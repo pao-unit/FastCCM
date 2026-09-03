@@ -1838,7 +1838,7 @@ class PairwiseCCM:
             raise
 
         with time_block(self.logger, self.device, timings, "select"):
-            if exclusion_rad is not None:
+            if exclusion_rad is not None and not self.__exclude_narrow(dist, lib_idx, sample_idx, exclusion_rad):
                 # Keep the broadcast intermediates boolean. Subtracting int64
                 # indices would materialize an 8-byte (samples x library) tensor.
                 allowed = (
@@ -1854,7 +1854,7 @@ class PairwiseCCM:
                 indices = self.__workspace("indices", sel, torch.long)
                 torch.topk(dist, n_nbrs_max, dim=2, largest=False, sorted=False,
                            out=(near_dist, indices))
-                near_dist.sqrt_()
+                near_dist.clamp_min_(0).sqrt_()
 
         with time_block(self.logger, self.device, timings, "weights"):
             weights, indices = self.__weights_from_dists(near_dist, indices, n_nbrs, n_nbrs_max)
@@ -1864,13 +1864,64 @@ class PairwiseCCM:
             self.logger.debug("Neighbor search timings: %s", timings_summary(timings, ["cdist", "select", "weights", "total"]))
         return weights, indices
 
+    # Random-access cost of the scatter path is roughly one cache line per
+    # touched element, so it only beats a streaming pass over the block while
+    # the window stays much narrower than the library.
+    _EXCLUSION_SCATTER_RATIO = 8
+
+    def __exclude_narrow(self, dist, lib_idx, sample_idx, exclusion_rad):
+        """
+        Mark the excluded library columns of each query without touching the
+        rest of the distance block.
+
+        Only the (2r+1) time steps around a query can be excluded, so the
+        columns are found through a time-index -> library-column table instead
+        of comparing every query against every library point. Returns False
+        when the window is wide enough that a full masked_fill_ is cheaper.
+        """
+        rad = int(exclusion_rad)
+        num_lib = int(dist.shape[2])
+        width = 2 * rad + 1
+        if rad < 0 or width * self._EXCLUSION_SCATTER_RATIO >= num_lib:
+            return False
+
+        num_points = int(lib_idx.max()) + 1
+        # Padded on both sides so the query-centred window never needs a bounds
+        # check: absent time steps stay at -1, and query indices past the end of
+        # the library (prediction mode) clamp onto the guaranteed -1 tail.
+        table = torch.full((num_points + 2 * rad + 1,), -1, dtype=torch.long, device=dist.device)
+        table[rad:rad + num_points].scatter_(
+            0, lib_idx, torch.arange(num_lib, device=dist.device)
+        )
+        window = torch.arange(width, device=dist.device)
+        cols = table[(sample_idx[:, None] + window[None, :]).clamp_(max=table.shape[0] - 1)]
+        present = cols >= 0
+
+        # Queries whose window holds no library point must be left alone; for the
+        # rest, empty slots are folded onto a column that is excluded anyway so
+        # the duplicated scatter writes stay harmless.
+        first = cols.masked_fill(~present, num_lib).amin(dim=1)  # (S,)
+        has_any = first < num_lib
+        cols = torch.where(present, cols, (first * has_any)[:, None])
+
+        idx = cols.unsqueeze(0).expand(dist.shape[0], -1, -1)
+        if bool(has_any.all()):
+            dist.scatter_(2, idx, float("inf"))
+        else:
+            keep = dist.gather(2, idx)
+            inf = torch.tensor(float("inf"), device=dist.device, dtype=dist.dtype)
+            dist.scatter_(2, idx, torch.where(has_any[None, :, None], inf, keep))
+        return True
+
     def __squared_euclidean_dist(self, sample, lib_index):
         """
         Squared `cdist(..., "use_mm_for_euclid_dist")` in a reusable buffer.
 
-        Rank squared distances and apply the monotonic square root only to the
-        selected neighbors. Distances that become equal only after float32 sqrt
-        rounding can select a different tied neighbor than the native path.
+        Rank raw squared distances and apply clamp and square root only to the
+        selected neighbors. Float32 cancellation can make near-zero squared
+        distances slightly negative, so this may choose a different member of a
+        zero-distance tie than the native path. Square-root rounding can likewise
+        create ties after selection.
         """
         comp = self._promoted_compute_dtype()
         q = self.__to_tensor(sample, dtype=comp)
@@ -1881,7 +1932,7 @@ class PairwiseCCM:
             "dist", (q.shape[0], q.shape[1], lib_index.num_points), comp
         )
         torch.matmul(augmented, lib_index.augmented.mT, out=dist)
-        return dist.clamp_min_(0)
+        return dist
 
     def __weights_from_dists(self, near_dist, indices, n_nbrs, n_nbrs_max):
         timings = {}
