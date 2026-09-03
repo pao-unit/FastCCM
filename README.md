@@ -13,25 +13,50 @@ FastCCM computes exact CCM scores equivalent to `pyEDM>=2.3.2`.
 
 ## Performance
 
-Measured on **CPU, Apple M4 Pro 64GB**
+Average runtime over three runs on an **Apple M4 Pro 64GB CPU**. All inputs
+use `float32`.
 
-CCM matrix timings (`E=5`, `exclusion_window=5`)
+### CCM matrices
 
-| Condition | CCM matrix / simplex (s) | CCM matrix / S-MAP (s) |
+Simplex and S-Map timings with `E=5`, `exclusion_window=5`, and a 10GB
+memory budget.
+
+| Condition | Simplex (s) | S-Map (s) |
 |---|---:|---:|
-| 100x100, T=1000 | 0.075 | 0.530 |
-| 200x200, T=1000 | 0.156 | 1.188 |
-| 800x800, T=500 | 0.721 | 5.501 |
-| 100x100, T=8000 | 3.581 | 14.194 |
+| 100x100, T=1000 | 0.050178 | 0.467506 |
+| 200x200, T=1000 | 0.132099 | 1.309896 |
+| 800x800, T=500 | 0.386433 | 5.922905 |
+| 100x100, T=8000 | 1.574023 | 11.787477 |
 
-Single time series timings (`E=20`, `exclusion_window=10`)
+### Flat arrays
 
-| Condition | Simplex projection (s) | S-MAP projection (s) |
+Simplex timings with `E=5`, `exclusion_window=5`, and a 16GB memory budget.
+
+| Sources | Targets | T | Time (s) |
+|---:|---:|---:|---:|
+| 1000 | 1 | 1000 | 0.309794 |
+| 5000 | 1 | 1000 | 1.646483 |
+| 20000 | 1 | 1000 | 6.693777 |
+| 20000 | 1 | 2000 | 24.540072 |
+| 1 | 1000 | 1000 | 0.017925 |
+| 1 | 5000 | 1000 | 0.075918 |
+| 1 | 20000 | 1000 | 0.291440 |
+| 1 | 20000 | 2000 | 0.381132 |
+
+### Single time series
+
+Simplex and S-Map self-prediction timings with `E=20`,
+`exclusion_window=10`, and a 10GB memory budget.
+
+| Condition | Simplex (s) | S-Map (s) |
 |---|---:|---:|
-| T=2000 | 0.006 | 0.010 |
-| T=8000 | 0.045 | 0.088 |
-| T=32000 | 0.755 | 1.380 |
-| T=128000 | 12.945 | 23.922 |
+| T=2000 | 0.003899 | 0.007809 |
+| T=8000 | 0.035738 | 0.078769 |
+| T=32000 | 0.469370 | 1.289859 |
+| T=128000 | 7.697001 | 21.109449 |
+
+See the full [CPU](scripts/README_CPU.md) and [GPU](scripts/README_GPU.md)
+benchmark reports for settings, ranges, and CPU-utilization results.
 
 ## Installation
 
@@ -189,5 +214,8 @@ print(scores_mm.shape)
 ## Related files
 
 - `notebooks/CCM results comparison.ipynb`
+- `scripts/README_CPU.md`
+- `scripts/README_GPU.md`
 - `scripts/benchmark_performance.py`
+- `scripts/benchmark_flat_arrays.py`
 - `scripts/benchmark_single_series_self_prediction.py`

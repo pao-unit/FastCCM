@@ -1839,8 +1839,13 @@ class PairwiseCCM:
 
         with time_block(self.logger, self.device, timings, "select"):
             if exclusion_rad is not None:
-                excluded = (lib_idx[None, :] - sample_idx[:, None]).abs() <= exclusion_rad
-                dist.masked_fill_(excluded.unsqueeze(0), float("inf"))
+                # Keep the broadcast intermediates boolean. Subtracting int64
+                # indices would materialize an 8-byte (samples x library) tensor.
+                allowed = (
+                    (lib_idx[None, :] > (sample_idx[:, None] + exclusion_rad)) |
+                    (lib_idx[None, :] < (sample_idx[:, None] - exclusion_rad))
+                )
+                dist.masked_fill_(~allowed.unsqueeze(0), float("inf"))
             if lib_index is None:
                 near_dist, indices = torch.topk(dist, n_nbrs_max, largest=False, sorted=False)
             else:
