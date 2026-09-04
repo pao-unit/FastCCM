@@ -1244,16 +1244,26 @@ class PairwiseCCM:
             for y0 in range(0, num_ts_Y, target_batch_size)
         )
         max_target_block_width = int(target_batch_size * max_E_Y)
-        gather_buf = torch.empty(
-            (num_ts_X * sample_batch_size * nbrs_num_max, max_target_block_width),
-            device=Y_lib_flat.device,
-            dtype=self.compute_dtype,
-        )
-        reduce_buf = torch.empty(
-            (num_ts_X * sample_batch_size, 1, max_target_block_width),
-            device=Y_lib_flat.device,
-            dtype=self.compute_dtype,
-        )
+        # Only the gather + `bmm` path needs the k-fold staging buffers.
+        if self._use_fused_reduce(nbrs_num_max, max_target_block_width):
+            gather_buf = None
+            reduce_buf = None
+            bag_offsets = torch.arange(
+                0, num_ts_X * sample_batch_size * nbrs_num_max, nbrs_num_max,
+                device=Y_lib_flat.device, dtype=torch.long,
+            )
+        else:
+            bag_offsets = None
+            gather_buf = torch.empty(
+                (num_ts_X * sample_batch_size * nbrs_num_max, max_target_block_width),
+                device=Y_lib_flat.device,
+                dtype=self.compute_dtype,
+            )
+            reduce_buf = torch.empty(
+                (num_ts_X * sample_batch_size, 1, max_target_block_width),
+                device=Y_lib_flat.device,
+                dtype=self.compute_dtype,
+            )
         #nbrs_mask = (torch.arange(nbrs_num_max).unsqueeze(0) < nbrs_num.unsqueeze(1))
         A = None if stream_kind is not None else torch.empty((subsample_size, max_E_Y, num_ts_Y, num_ts_X), device=out_device, dtype=self.dtype)
         for s0 in batch_starts(self.logger, subsample_size, sample_batch_size, "simplex batches"):
@@ -1283,6 +1293,7 @@ class PairwiseCCM:
             batch_queries = s1 - s0
             flat_indices = indices.reshape(-1)
             weights_rows = weights_c.reshape(num_ts_X * batch_queries, 1, nbrs_num_max)
+            weights_flat = weights_c.reshape(-1)
             flat_count = int(flat_indices.numel())
             batch_rows = int(num_ts_X * batch_queries)
             Y_sample_batch_view = None
@@ -1297,9 +1308,15 @@ class PairwiseCCM:
             for y0, y1 in target_ranges:
                 y_width = (y1 - y0) * max_E_Y
 
+                fused = bag_offsets is not None and self._use_fused_reduce(
+                    nbrs_num_max, y_width
+                )
+
                 t_part = tic(self.logger, self.device) if self._debug_enabled() else None
                 Y_src = Y_lib_flat[:, y0 * max_E_Y:y1 * max_E_Y]
-                if y_width == max_target_block_width:
+                if fused:
+                    Y_idx = None  # folded into the weighted sum below
+                elif y_width == max_target_block_width:
                     Y_idx = torch.index_select(
                         Y_src,
                         0,
@@ -1316,7 +1333,15 @@ class PairwiseCCM:
                     gather_ms += toc_ms(self.logger, self.device, t_part)
 
                 t_part = tic(self.logger, self.device) if self._debug_enabled() else None
-                if y_width == max_target_block_width:
+                if fused:
+                    A_y = torch.nn.functional.embedding_bag(
+                        flat_indices,
+                        Y_src,
+                        bag_offsets[:batch_rows],
+                        mode="sum",
+                        per_sample_weights=weights_flat,
+                    ).reshape(num_ts_X, batch_queries, y1 - y0, max_E_Y)
+                elif y_width == max_target_block_width:
                     A_y = torch.bmm(
                         weights_rows,
                         Y_idx,
@@ -1374,7 +1399,7 @@ class PairwiseCCM:
                     ),
                 )
 
-            del weights, indices, weights_c, flat_indices, weights_rows, Y_sample_batch_view
+            del weights, indices, weights_c, flat_indices, weights_rows, weights_flat, Y_sample_batch_view
 
         if stream_kind is not None:
             return stream_metric_state_finalize(stream_kind, stream_state)
@@ -1781,6 +1806,27 @@ class PairwiseCCM:
         differs from CPU and CUDA.
         """
         return self.device.startswith(("cpu", "cuda"))
+
+    # `bmm` on (rows, 1, k) x (rows, k, N) leaves its packed kernel once the
+    # per-row right operand stops fitting the blocking it uses -- measured at
+    # k*N ~ 450 for k in 2..21 -- and past that point it is ~50x slower. Stay
+    # under it with margin.
+    _BMM_FAST_ELEMS = 384
+
+    def _use_fused_reduce(self, nbrs_num_max, y_width):
+        """
+        Whether to run the simplex weighted average through `embedding_bag`
+        instead of gather + `bmm`.
+
+        The fused path folds the neighbor gather into the weighted sum, so it
+        never materializes the (rows, k, y_width) block and has no width cliff.
+        Below the threshold `bmm` is still the faster of the two. Restricted to
+        CPU: the cliff is a CPU batched-GEMM dispatch artifact and the CUDA
+        path has not been measured.
+        """
+        if not self.device.startswith("cpu"):
+            return False
+        return int(nbrs_num_max) * int(y_width) > self._BMM_FAST_ELEMS
 
     def _release_nbr_workspace(self):
         self._nbr_workspace = {}
