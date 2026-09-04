@@ -1819,12 +1819,15 @@ class PairwiseCCM:
         instead of gather + `bmm`.
 
         The fused path folds the neighbor gather into the weighted sum, so it
-        never materializes the (rows, k, y_width) block and has no width cliff.
-        Below the threshold `bmm` is still the faster of the two. Restricted to
-        CPU: the cliff is a CPU batched-GEMM dispatch artifact and the CUDA
-        path has not been measured.
+        never materializes the (rows, k, y_width) block. Below the threshold
+        `bmm` is still the faster of the two.
+
+        CUDA has no width cliff, but skipping the k-fold intermediate pays
+        there too, and the target axis is left unsplit on CUDA so the width
+        comes from the target count rather than from E_y. MPS keeps `bmm`;
+        it has not been measured.
         """
-        if not self.device.startswith("cpu"):
+        if not self.device.startswith(("cpu", "cuda")):
             return False
         return int(nbrs_num_max) * int(y_width) > self._BMM_FAST_ELEMS
 
