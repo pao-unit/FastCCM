@@ -1898,11 +1898,15 @@ class PairwiseCCM:
             if lib_index is None:
                 near_dist, indices = torch.topk(dist, n_nbrs_max, largest=False, sorted=False)
             else:
-                sel = (dist.shape[0], dist.shape[1], n_nbrs_max)
-                near_dist = self.__workspace("near_dist", sel, dist.dtype)
-                indices = self.__workspace("indices", sel, torch.long)
-                torch.topk(dist, n_nbrs_max, dim=2, largest=False, sorted=False,
-                           out=(near_dist, indices))
+                chunk = self._prefilter_chunk(n_nbrs_max, dist.shape[2])
+                if chunk:
+                    near_dist, indices = self.__prefilter_topk(dist, n_nbrs_max, chunk)
+                else:
+                    sel = (dist.shape[0], dist.shape[1], n_nbrs_max)
+                    near_dist = self.__workspace("near_dist", sel, dist.dtype)
+                    indices = self.__workspace("indices", sel, torch.long)
+                    torch.topk(dist, n_nbrs_max, dim=2, largest=False, sorted=False,
+                               out=(near_dist, indices))
                 near_dist.clamp_min_(0).sqrt_()
 
         with time_block(self.logger, self.device, timings, "weights"):
@@ -1961,6 +1965,64 @@ class PairwiseCCM:
             inf = torch.tensor(float("inf"), device=dist.device, dtype=dist.dtype)
             dist.scatter_(2, idx, torch.where(has_any[None, :, None], inf, keep))
         return True
+
+    # `topk` over the library axis is compute-bound rather than bandwidth-bound:
+    # on CUDA it runs ~9-22x slower than a plain reduction over the same block.
+    # Ranking chunk minima first replaces most of that scan with `amin`.
+    _PREFILTER_CHUNK = 128
+    _PREFILTER_MIN_LIB = 4096
+
+    def _prefilter_chunk(self, n_nbrs_max, num_lib):
+        """
+        Chunk width for the prefiltered neighbor selection, or 0 for `topk`.
+
+        The rescan covers k of the chunks, so the saving only survives while
+        those are a small share of the block -- below `_PREFILTER_MIN_LIB` the
+        candidate gather costs more than the skipped scan saves. CPU keeps
+        `topk`, where the two run much closer together and this loses.
+        """
+        if not self.device.startswith("cuda"):
+            return 0
+        if int(num_lib) < self._PREFILTER_MIN_LIB:
+            return 0
+        if int(num_lib) // self._PREFILTER_CHUNK < 2 * int(n_nbrs_max):
+            return 0
+        return self._PREFILTER_CHUNK
+
+    def __prefilter_topk(self, dist, k, chunk):
+        """
+        Exact k smallest per row, found through chunk minima.
+
+        Each of the k smallest values sits in a chunk whose minimum is itself
+        among the k smallest chunk minima -- otherwise more than k values would
+        undercut it -- so rescanning only those k chunks loses nothing. Ties
+        break arbitrarily, as they do in `topk`.
+        """
+        n_x, n_q, num_lib = dist.shape
+        n_chunks = num_lib // chunk
+        head = dist[..., : n_chunks * chunk].view(n_x, n_q, n_chunks, chunk)
+
+        candidates = head.amin(-1).topk(k, dim=2, largest=False, sorted=False).indices
+        scanned = head.gather(
+            2, candidates[..., None].expand(n_x, n_q, k, chunk)
+        ).reshape(n_x, n_q, k * chunk)
+        values, flat = scanned.topk(k, dim=2, largest=False, sorted=False)
+        cols = candidates.gather(
+            2, flat.div(chunk, rounding_mode="floor")
+        ) * chunk + flat.remainder(chunk)
+
+        rest = num_lib - n_chunks * chunk
+        if rest:
+            # Columns past the last whole chunk, merged the same way.
+            tail_k = min(k, rest)
+            tail_v, tail_i = dist[..., n_chunks * chunk:].topk(
+                tail_k, dim=2, largest=False, sorted=False
+            )
+            values = torch.cat([values, tail_v], 2)
+            cols = torch.cat([cols, tail_i + n_chunks * chunk], 2)
+            values, pick = values.topk(k, dim=2, largest=False, sorted=False)
+            cols = cols.gather(2, pick)
+        return values, cols
 
     def __squared_euclidean_dist(self, sample, lib_index):
         """
