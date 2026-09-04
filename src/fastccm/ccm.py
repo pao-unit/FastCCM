@@ -178,7 +178,7 @@ class PairwiseCCM:
             metric = "corr",
             subtract_global = False,
             batch_size="auto",
-            clean_after=True,
+            clean_after=False,
             **kwargs
     ):
         """
@@ -319,7 +319,7 @@ class PairwiseCCM:
             metric = "corr",
             subtract_global = False,
             batch_size="auto",
-            clean_after=True,
+            clean_after=False,
             **kwargs
     ):
         """
