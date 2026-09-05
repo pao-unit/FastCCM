@@ -4,6 +4,7 @@ import os
 import numpy as np
 import torch
 from .utils.metrics import (
+    _corr_accum_dtype,
     get_metric,
     get_streaming_metric_kind,
     stream_metric_state_init,
@@ -1059,6 +1060,19 @@ class PairwiseCCM:
             simplex_extra_base_bytes = 0
             if mode == "score":
                 simplex_extra_base_bytes = int(Y_smp_s.numel() * torch.tensor([], dtype=self.dtype).element_size())
+                # A streamed metric holds its accumulators for the whole call --
+                # three source-wide plus two target-side for `corr`, the widest
+                # of them -- and they are promoted to float64 on CPU. Nothing in
+                # `_simplex_base_bytes` covers that, so without this the budget
+                # runs over by their size: 381MB at 1000x1000 sources/targets
+                # with E_y=10, which is the regime the budget exists to protect.
+                if get_streaming_metric_kind(metric_fn) is not None:
+                    acc_bytes = torch.tensor(
+                        [], dtype=_corr_accum_dtype(self.compute_dtype, self.device)
+                    ).element_size()
+                    simplex_extra_base_bytes += int(
+                        (3 * num_ts_X + 2) * max_E_Y * num_ts_Y * acc_bytes
+                    )
             else:
                 simplex_extra_base_bytes = int(predict_output_bytes)
             if auto_batch:
