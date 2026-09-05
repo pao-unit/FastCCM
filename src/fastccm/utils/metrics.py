@@ -143,8 +143,29 @@ def get_streaming_metric_kind(metric_fn) -> Optional[str]:
     }.get(name)
 
 
-def stream_metric_state_init(kind: str, D, Y, X, *, device, dtype, shared_target: bool = False):
+def _grouped(t, group):
+    """View a (..., G * group) tensor as (..., G, group)."""
+    return t.reshape(*t.shape[:-1], t.shape[-1] // group, group)
+
+
+def _ungroup(t, group):
+    """Widen per-group target statistics back to one column per source."""
+    return t if group <= 1 else t.repeat_interleave(group, dim=-1)
+
+
+def stream_metric_state_init(kind: str, D, Y, X, *, device, dtype, shared_target: bool = False,
+                             target_group: int = 1):
     shape_dyx = (D, Y, X)
+    # `target_group` says the targets repeat every `group` source columns -- what
+    # a vectorised trial sweep produces, where each trial's block of sources all
+    # score against that trial's own targets. The target-side statistics then
+    # need one column per group rather than per source, and the target-side
+    # passes shrink by the same factor. `shared_target` is the limiting case of
+    # one group covering everything.
+    group = max(int(target_group), 1)
+    if group > 1 and int(X) % group:
+        raise ValueError("target_group must divide the source axis.")
+    target_x = int(X) // group
     out_dtype = dtype
     acc_dtype = _corr_accum_dtype(dtype, device) if kind == "corr" else dtype
     z_dyx = torch.zeros(shape_dyx, device=device, dtype=acc_dtype)
@@ -155,10 +176,11 @@ def stream_metric_state_init(kind: str, D, Y, X, *, device, dtype, shared_target
         "acc_dtype": acc_dtype,
         "device": device,
         "shared_target": bool(shared_target),
+        "target_group": group,
     }
 
     if kind == "corr":
-        target_x = 1 if shared_target else X
+        target_x = 1 if shared_target else target_x
         z_dyb = torch.zeros((D, Y, target_x), device=device, dtype=acc_dtype)
         centered = acc_dtype != dtype and int(X) >= _CORR_CENTERED_MIN_SOURCES
         state["corr_centered"] = centered
@@ -188,7 +210,7 @@ def stream_metric_state_init(kind: str, D, Y, X, *, device, dtype, shared_target
     if kind == "neg_nrmse":
         shape_yx = (Y, X)
         z_yx = torch.zeros(shape_yx, device=device, dtype=dtype)
-        target_x = 1 if shared_target else X
+        target_x = 1 if shared_target else target_x
         z_yb = torch.zeros((Y, target_x), device=device, dtype=dtype)
         state.update({
             "sum_sq_err_sd": z_yx.clone(),  # over S and D
@@ -207,6 +229,16 @@ def stream_metric_state_update(kind: str, state, A_blk, B_blk, *, y_start: int =
     dy1 = (slice(None), slice(int(y_start), y_stop), slice(None))
     yx = (slice(int(y_start), y_stop), slice(None))
     y1 = (slice(int(y_start), y_stop), slice(None))
+
+    group = int(state.get("target_group", 1))
+    # With grouped targets `B_blk` carries one column per group, so pairing it
+    # with `A_blk` is a broadcast over the group's sources rather than a widened
+    # copy: the target-side reductions stay `group` times narrower.
+    def pair(a, b):
+        return (_grouped(a, group), b.unsqueeze(-1)) if group > 1 else (a, b)
+
+    def flat(t):
+        return t.reshape(*t.shape[:-2], t.shape[-2] * t.shape[-1]) if group > 1 else t
 
     if kind == "corr":
         if state.get("shared_target", False):
@@ -232,7 +264,8 @@ def stream_metric_state_update(kind: str, state, A_blk, B_blk, *, y_start: int =
             centeredB = deltaB_work - mean_deltaB
             m2A_blk = (centeredA * centeredA).sum(dim=0).to(state["acc_dtype"])
             m2B_blk = (centeredB * centeredB).sum(dim=0).to(state["acc_dtype"])
-            coAB_blk = (centeredA * centeredB).sum(dim=0).to(state["acc_dtype"])
+            cA, cB = pair(centeredA, centeredB)
+            coAB_blk = flat((cA * cB).sum(dim=0)).to(state["acc_dtype"])
             meanA_blk = anchorA[0].to(state["acc_dtype"]) + mean_deltaA.to(state["acc_dtype"])
             meanB_blk = anchorB[0].to(state["acc_dtype"]) + mean_deltaB.to(state["acc_dtype"])
 
@@ -250,7 +283,8 @@ def stream_metric_state_update(kind: str, state, A_blk, B_blk, *, y_start: int =
                 merge_factor = float(n_prev * n_blk) / float(n_total)
                 deltaA = meanA_blk - state["meanA"][dyx]
                 deltaB = meanB_blk - state["meanB"][dy1]
-                state["coAB"][dyx] += coAB_blk + deltaA * deltaB * merge_factor
+                dA, dB = pair(deltaA, deltaB)
+                state["coAB"][dyx] += coAB_blk + flat(dA * dB) * merge_factor
                 state["m2A"][dyx] += m2A_blk + deltaA * deltaA * merge_factor
                 state["m2B"][dy1] += m2B_blk + deltaB * deltaB * merge_factor
                 state["meanA"][dyx] += deltaA * merge_weight
@@ -262,18 +296,20 @@ def stream_metric_state_update(kind: str, state, A_blk, B_blk, *, y_start: int =
             state["sumB"][dy1] += B_blk.sum(dim=0)
             state["sumAA"][dyx] += (A_blk * A_blk).sum(dim=0)
             state["sumBB"][dy1] += (B_blk * B_blk).sum(dim=0)
-            state["sumAB"][dyx] += (A_blk * B_blk).sum(dim=0)
+            a_pair, b_pair = pair(A_blk, B_blk)
+            state["sumAB"][dyx] += flat((a_pair * b_pair).sum(dim=0))
         return
+    a_pair, b_pair = pair(A_blk, B_blk)
     if kind in ("mse", "rmse"):
-        d = A_blk - B_blk
-        state["sum_sq_err"][dyx] += (d * d).sum(dim=0)
+        d = a_pair - b_pair
+        state["sum_sq_err"][dyx] += flat((d * d).sum(dim=0))
         return
     if kind == "mae":
-        state["sum_abs_err"][dyx] += (A_blk - B_blk).abs().sum(dim=0)
+        state["sum_abs_err"][dyx] += flat((a_pair - b_pair).abs().sum(dim=0))
         return
     if kind == "neg_nrmse":
-        d = A_blk - B_blk
-        state["sum_sq_err_sd"][yx] += (d * d).sum(dim=(0, 1))
+        d = a_pair - b_pair
+        state["sum_sq_err_sd"][yx] += flat((d * d).sum(dim=0)).sum(dim=0)
         if state.get("shared_target", False):
             B_blk = B_blk[..., :1]
         state["sumB_sd"][y1] += B_blk.sum(dim=(0, 1))
@@ -291,15 +327,18 @@ def stream_metric_state_finalize(kind: str, state, *, eps=1e-12, neg_nrmse_T=0.5
     n_t = torch.tensor(float(n), device=device, dtype=acc_dtype)
     eps_t = torch.tensor(eps, device=device, dtype=acc_dtype)
 
+    group = int(state.get("target_group", 1))
     if kind == "corr":
         if state.get("corr_centered", False):
             num = state["coAB"]
             denA = state["m2A"]
-            denB = state["m2B"]
+            denB = _ungroup(state["m2B"], group)
         else:
-            num = state["sumAB"] - (state["sumA"] * state["sumB"] / n_t)
+            sumB = _ungroup(state["sumB"], group)
+            sumBB = _ungroup(state["sumBB"], group)
+            num = state["sumAB"] - (state["sumA"] * sumB / n_t)
             denA = state["sumAA"] - (state["sumA"] * state["sumA"] / n_t)
-            denB = state["sumBB"] - (state["sumB"] * state["sumB"] / n_t)
+            denB = sumBB - (sumB * sumB / n_t)
         den = torch.sqrt(denA.clamp_min(0.0) * denB.clamp_min(0.0) + eps_t)
         return (num / den).clamp(-1.0, 1.0).to(dtype=out_dtype)
     if kind == "mse":
@@ -312,8 +351,8 @@ def stream_metric_state_finalize(kind: str, state, *, eps=1e-12, neg_nrmse_T=0.5
         cnt_t = torch.tensor(float(n * D), device=device, dtype=out_dtype)
         mse = state["sum_sq_err_sd"] / cnt_t
         rmse = torch.sqrt(mse + eps_t)
-        muB = state["sumB_sd"] / cnt_t
-        varB = (state["sumBB_sd"] / cnt_t) - (muB * muB)
+        muB = _ungroup(state["sumB_sd"], group) / cnt_t
+        varB = (_ungroup(state["sumBB_sd"], group) / cnt_t) - (muB * muB)
         rmse_base = torch.sqrt(varB.clamp_min(0.0) + eps_t)
         T_t = torch.tensor(neg_nrmse_T, device=device, dtype=out_dtype)
         out = torch.exp(-((1.0 / T_t) * torch.pow(rmse / (rmse_base + eps_t), 2)))
