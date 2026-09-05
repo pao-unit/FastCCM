@@ -42,6 +42,37 @@ class Functions:
             log_file=log_file,
         )
 
+    # Vectorising trials trades launch overhead for a wider working set. The
+    # streaming metric no longer pays for it -- grouped targets keep its
+    # target-side reductions one column per trial rather than per source -- but
+    # the stacked source axis still widens the score block and the distance
+    # block, which eventually costs more than the saved launches. Measured
+    # (10 sizes, 10 trials, sample_size="auto"), swept-per-trial / vectorised:
+    #   CPU   n_x=1: 1.66x  n_x=5: 1.31x  n_x=20: 1.41x  n_x=50: 1.22x
+    #         n_x=100: 0.91x  n_x=200: 0.82x
+    #   CUDA  n_x=1: 2.51x  n_x=5: 1.49x  n_x=20: 1.29x  n_x=50: 1.09x
+    #         n_x=200: 0.96x
+    # Thresholds sit between the last shape that gained and the first that lost
+    # (n_x=50 scores 1.9e7 elements here, n_x=100 scores 7.5e7). They are
+    # calibrated on few points; `trials` on `score_matrix_sweep` is explicit and
+    # is not subject to this policy.
+    _TRIAL_VECTOR_MAX_SCORE_ELEMS_CPU = 40_000_000
+    _TRIAL_VECTOR_MAX_SCORE_ELEMS_CUDA = 100_000_000
+
+    def _vectorize_trials(self, n_sizes, n_X, n_Y, max_E_Y, sample_size, min_len):
+        """Whether folding trials onto the source axis pays for this shape."""
+        if sample_size is None:
+            queries = min_len
+        elif isinstance(sample_size, str):
+            queries = min(min_len // 6, 250)
+        else:
+            queries = int(sample_size)
+        elems = int(n_sizes) * int(n_X) * int(n_Y) * int(max_E_Y) * max(int(queries), 1)
+        budget = (self._TRIAL_VECTOR_MAX_SCORE_ELEMS_CUDA
+                  if str(self.ccm.device).startswith("cuda")
+                  else self._TRIAL_VECTOR_MAX_SCORE_ELEMS_CPU)
+        return elems <= budget
+
     def _common_length(self, *series_groups):
         return min(arr.shape[0] for group in series_groups for arr in group)
 
@@ -358,9 +389,6 @@ class Functions:
         if Y_emb is None:
             Y_emb = X_emb  # Default Y to X if not provided
 
-        num_ts_X = len(X_emb)
-        num_ts_Y = len(Y_emb)
-
         min_len = min(
             min(y.shape[0] for y in Y_emb),
             min(x.shape[0] for x in X_emb)
@@ -376,45 +404,40 @@ class Functions:
         elif not isinstance(library_sizes, (list, np.ndarray)):
             raise ValueError("library_sizes must be either 'auto', a list, or a numpy array.")
 
-            
-        res_X_to_Y = []
-        res_Y_to_X = []
-
-        # Running convergence test for each subset size
-        for size in library_sizes:
-            res_X_to_Y_size = []
-            res_Y_to_X_size = []
-
+        # Seeds are unchanged, so each (size, trial) sees the library it saw as
+        # a separate call. smap has no swept kernel and keeps the loop.
+        sweep = dict(
+            library_sizes=library_sizes, sample_size=sample_size,
+            exclusion_window=exclusion_window, tp=tp, method=method,
+            metric=metric, clean_after=False, **kwargs
+        )
+        vectorized = method == "simplex" and trials > 1 and self._vectorize_trials(
+            len(library_sizes), len(X_emb), len(Y_emb),
+            max(max(y.shape[-1] for y in Y_emb), max(x.shape[-1] for x in X_emb)),
+            sample_size, min_len,
+        )
+        if vectorized:
+            xy = self.ccm.score_matrix_sweep(
+                X_emb, Y_emb, trials=trials,
+                seed=None if seed is None else int(seed), **sweep)
+            yx = self.ccm.score_matrix_sweep(
+                Y_emb, X_emb, trials=trials,
+                seed=None if seed is None else int(seed) + 10000, **sweep)
+            res_X_to_Y, res_Y_to_X = list(xy), list(yx)
+        else:
+            res_X_to_Y, res_Y_to_X = [], []
             for t in range(trials):
-                trial_seed_xy = None if seed is None else int(seed) + t
-                trial_seed_yx = None if seed is None else int(seed) + t + 10000
-                # Calculate CCM for X -> Y
-                res_X_to_Y_size.append(self.ccm.score_matrix(
-                    X_emb, Y_emb,
-                    library_size=size, sample_size=sample_size,
-                    exclusion_window=exclusion_window, tp=tp,
-                    method=method,
-                    seed=trial_seed_xy, metric=metric, clean_after=False, **kwargs
-                ))
+                res_X_to_Y.append(self.ccm.score_matrix_sweep(
+                    X_emb, Y_emb, seed=None if seed is None else int(seed) + t, **sweep))
+                res_Y_to_X.append(self.ccm.score_matrix_sweep(
+                    Y_emb, X_emb, seed=None if seed is None else int(seed) + t + 10000, **sweep))
 
-                # Calculate CCM for Y -> X
-                res_Y_to_X_size.append(self.ccm.score_matrix(
-                    Y_emb, X_emb,
-                    library_size=size, sample_size=sample_size,
-                    exclusion_window=exclusion_window, tp=tp,
-                    method=method,
-                    seed=trial_seed_yx, metric=metric, clean_after=False, **kwargs
-                ))
-                
-            # Store results for current subset size
-            res_X_to_Y.append(res_X_to_Y_size)
-            res_Y_to_X.append(res_Y_to_X_size)
-
-        # Convert lists to numpy arrays for easier analysis and visualization
+        # Each entry is (n_sizes, E, n_target, n_source); stack trials behind the
+        # size axis to keep the documented (n_sizes, trials, ...) layout.
         return {
             "library_sizes": np.array(library_sizes),
-            "X_to_Y": np.array(res_X_to_Y),
-            "Y_to_X": np.array(res_Y_to_X)
+            "X_to_Y": np.stack(res_X_to_Y, axis=1),
+            "Y_to_X": np.stack(res_Y_to_X, axis=1)
         }
 
     def prediction_interval_test(
