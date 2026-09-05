@@ -343,11 +343,13 @@ def auto_batch_size_simplex(
     budget_gb=2.0,
     target_batch_size=None,
     extra_base_bytes: int = 0,
+    num_widths: int = 1,
 ):
     num_ts_X, L, max_E_X = X_lib.shape
     num_ts_Y, _, max_EY = Y_lib_s.shape
     S = X_sample.shape[1]
     nX, nY, Ey, K = int(num_ts_X), int(num_ts_Y), int(max_EY), int(nbrs_num_max)
+    nW = max(int(num_widths), 1)
     device_type = X_lib.device.type
 
     cbytes = _dtype_bytes(compute_dtype)
@@ -391,11 +393,13 @@ def auto_batch_size_simplex(
     else:
         y_batch = resolve_simplex_target_batch_size(nY, target_batch_size)
 
+    # A library-size sweep shares one distance block across widths but keeps a
+    # selection and a reduction per width, so only those carry the multiplier.
     search_per_sample = (
-        cbytes * (nX * L + nX * K) +
-        (dbytes + ibytes) * (nX * K)
+        cbytes * (nX * L + nW * nX * K) +
+        (dbytes + ibytes) * (nW * nX * K)
     )
-    reduce_per_sample = (
+    reduce_per_sample = nW * (
         cbytes * (nX * K * y_batch * Ey + nX * y_batch * Ey) +
         dbytes * (nX * y_batch * Ey)
     )
