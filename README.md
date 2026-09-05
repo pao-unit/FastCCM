@@ -8,7 +8,8 @@ FastCCM computes exact CCM scores equivalent to `pyEDM>=2.3.2`.
 
 - Pairwise CCM and pairwise S-Map.
 - Separate source and target sets.
-- Vectorized `E`, `tau`, `tp` search and convergence testing.
+- Vectorized `E`, `tau`, `tp` search and convergence testing, with library
+  sizes and trials swept in one pass.
 - Blocked execution, auto batching, and memmap output for large matrices.
 
 ## Performance
