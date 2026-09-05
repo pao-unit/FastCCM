@@ -341,15 +341,16 @@ class _SimplexMixin:
 
     # `bmm` on (rows, 1, k) x (rows, k, N) leaves its packed kernel once the
     # per-row right operand stops fitting the blocking it uses -- measured at
-    # k*N ~ 450 for k in 2..21 -- and past that point it is ~50x slower. Stay
-    # under it with margin.
+    # k*N ~ 450 for k in 2..21 -- and past that it is ~50x slower.
     _BMM_FAST_ELEMS = 384
 
-    # The staging block the `bmm` path materializes is (rows, k, y_width), so it
-    # also grows with the row count -- which a library-size sweep multiplies by
-    # the number of widths. Once it is this far past cache, allocating and
-    # streaming it costs more than `bmm`'s per-row advantage saves.
-    _BMM_STAGING_MAX_BYTES = 64 * 1024 * 1024
+    # The staging block that path materializes is (rows, k, y_width), so it also
+    # grows with the row count -- which a sweep multiplies by the number of
+    # widths. Past this size, allocating and streaming it costs more than
+    # `bmm`'s per-row advantage saves. Calibrated from both sides: 800 sources
+    # stage 77MB and still want `bmm` (64MB there costs 7%), while a 100x100
+    # sweep stages 384MB and wants the fused path (12% if left out).
+    _BMM_STAGING_MAX_BYTES = 128 * 1024 * 1024
 
     def _use_fused_reduce(self, nbrs_num_max, y_width, rows=None):
         """
