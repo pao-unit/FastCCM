@@ -32,6 +32,23 @@ import math
 import logging
 #torch.set_num_threads(os.cpu_count())  
 #torch.set_num_interop_threads(1)
+def _as_size_list(sizes):
+    """Requested library sizes as positive ints, in the caller's own order."""
+    if isinstance(sizes, (torch.Tensor, np.ndarray)):
+        sizes = sizes.tolist()
+    try:
+        out = [int(v) for v in sizes]
+    except TypeError:
+        raise ValueError(
+            "library_sizes must be a sequence of positive ints."
+        ) from None
+    if not out:
+        raise ValueError("library_sizes must contain at least one size.")
+    if min(out) <= 0:
+        raise ValueError("library_sizes must contain only positive sizes.")
+    return out
+
+
 def _resolve_dtype(x):
     if isinstance(x, torch.dtype):
         return x
@@ -47,6 +64,34 @@ def _resolve_dtype(x):
     if isinstance(dt, torch.dtype):
         return dt
     raise ValueError(f"Unknown dtype: {x!r}")
+
+
+class _TrialLayout:
+    """
+    How independent trials are folded onto the source axis.
+
+    A trial redraws both its library and its query points, so it cannot share a
+    distance block with another trial. Stacking trials onto the source axis
+    still pays on accelerators, where a sweep of a few series is launch-bound
+    rather than compute-bound: the sources of trial `t` occupy the rows
+    `[t * sources, (t + 1) * sources)` of every per-source tensor.
+
+    `lib_idx` and `smpl_idx` are (trials, ...) index tensors -- one row per
+    trial -- and are what the temporal exclusion and the target gather need in
+    order to keep each block pointed at its own draw.
+    """
+
+    __slots__ = ("trials", "sources", "lib_idx", "smpl_idx")
+
+    def __init__(self, trials, sources, lib_idx, smpl_idx):
+        self.trials = int(trials)
+        self.sources = int(sources)
+        self.lib_idx = lib_idx
+        self.smpl_idx = smpl_idx
+
+    @property
+    def rows(self):
+        return self.trials * self.sources
 
 
 class _NeighborLibrary:
@@ -279,6 +324,12 @@ class PairwiseCCM:
         if Y_emb is None:
             Y_emb = X_emb
 
+        if isinstance(library_size, (list, tuple, np.ndarray, torch.Tensor)):
+            raise ValueError(
+                "library_size must be a single size; use score_matrix_sweep() to "
+                "score several library sizes in one pass."
+            )
+
         self.logger.info(
             "score_matrix started (n_x=%d, n_y=%d, method=%s, tp=%d, metric=%s)",
             len(X_emb), len(Y_emb), method, tp, metric
@@ -306,6 +357,146 @@ class PairwiseCCM:
             self._release_nbr_workspace()
             soft_clear(self.logger, self.device)
         return r_AB
+
+    def score_matrix_sweep(
+            self,
+            X_emb,
+            Y_emb = None,
+            library_sizes = None,
+            trials = None,
+            sample_size = None,
+            exclusion_window = 0,
+            tp = 0,
+            method = "simplex",
+            seed = None,
+            metric = "corr",
+            subtract_global = False,
+            batch_size = "auto",
+            clean_after = False,
+            **kwargs
+    ):
+        """
+        Score several library sizes in a single pass over the data.
+
+        Equivalent to calling `score_matrix` once per size with the same `seed`,
+        but the shared work is done once. For a fixed seed the library indices
+        are `randperm(n)[:L]`, so the libraries of the different sizes are nested
+        prefixes of one permutation and the query set does not depend on the size
+        at all. One library is therefore drawn at the largest size, one distance
+        block is computed against it, and each size reads the matching prefix.
+        Neighbor selection walks the prefixes in ascending order, merging the
+        previous winners with the columns each size adds, so the library is
+        scanned once for the whole sweep.
+
+        Parameters
+        ----------
+        X_emb : list[array-like]
+            Source embeddings, one per series; see `score_matrix`.
+        Y_emb : list[array-like] or None, default None
+            Target embeddings. If None, uses X_emb.
+        library_sizes : sequence[int]
+            Library sizes to score. Order is preserved in the output; duplicates
+            are allowed. Sizes past the usable window (`min_common_len - tp`) are
+            clamped to it, so they repeat the full-library result rather than
+            failing. The smallest size must be at least the neighbor count
+            (`nbrs_num`, by default `E_x + 1`).
+        sample_size : int or {"auto", None}, default None
+            Number of query points, shared by every size; see `score_matrix`.
+        exclusion_window, tp, method, seed, metric, subtract_global, batch_size, clean_after
+            As in `score_matrix`. `exclusion_window` depends only on the library
+            and query time indices, never on the size, so it is applied once.
+
+        trials : int or None, default None
+            When given, run `trials` independent repetitions in one pass and add
+            a leading trial axis to the result. Trial `t` draws exactly what
+            `seed + t` would have drawn as a separate call, so a vectorised run
+            reproduces the equivalent loop. The repetitions are stacked onto the
+            source axis rather than looped, which mainly pays on an accelerator:
+            a sweep over few series is launch-bound, and this turns `trials`
+            launches into one. Not supported with `subtract_global`.
+
+        Returns
+        -------
+        np.ndarray
+            CCM scores with shape (n_sizes, E_y, n_Y, n_X), where `n_sizes` is
+            `len(library_sizes)` and the leading axis follows the order given.
+            With `trials`, the shape gains a leading trial axis:
+            (trials, n_sizes, E_y, n_Y, n_X).
+
+        Raises
+        ------
+        ValueError
+            If `library_sizes` is empty or holds non-positive values, or if the
+            smallest size is below the neighbor count.
+
+        Notes
+        -----
+        Selection ties break arbitrarily, as they do in `torch.topk`, so a swept
+        score can differ from the matching `score_matrix` call in the last bits
+        when a query has equidistant library points.
+
+        `method="smap"` has no swept kernel and falls back to one `score_matrix`
+        call per size, which returns the same values with no shared work.
+        """
+        if Y_emb is None:
+            Y_emb = X_emb
+
+        sizes = _as_size_list(library_sizes)
+
+        self.logger.info(
+            "score_matrix_sweep started (n_x=%d, n_y=%d, n_sizes=%d, trials=%s, method=%s, tp=%d, metric=%s)",
+            len(X_emb), len(Y_emb), len(sizes), str(trials), method, tp, metric
+        )
+
+        if method == "smap":
+            if trials is not None:
+                raise ValueError(
+                    "trials are only vectorised for method='simplex'; call "
+                    "score_matrix_sweep once per trial for smap."
+                )
+            self.logger.info("smap has no swept kernel; running one call per size")
+            out = np.stack([
+                self.score_matrix(
+                    X_emb, Y_emb,
+                    library_size=size,
+                    sample_size=sample_size,
+                    exclusion_window=exclusion_window,
+                    tp=tp,
+                    method=method,
+                    seed=seed,
+                    metric=metric,
+                    subtract_global=subtract_global,
+                    batch_size=batch_size,
+                    clean_after=False,
+                    **kwargs
+                )
+                for size in sizes
+            ])
+        else:
+            r_AB = self.__ccm_core(
+                mode="score",
+                X_lib_list=X_emb,
+                Y_lib_list=Y_emb,
+                X_sample_list=X_emb,
+                library_size=sizes,
+                sample_size=sample_size,
+                exclusion_window=exclusion_window,
+                tp=tp,
+                method=method,
+                seed=seed,
+                metric=metric,
+                subtract_global=subtract_global,
+                batch_size=batch_size,
+                trials=trials,
+                **kwargs
+            )
+            out = r_AB.to("cpu").numpy()
+
+        self.logger.info("score_matrix_sweep completed with output shape %s", out.shape)
+        if clean_after:
+            self._release_nbr_workspace()
+            soft_clear(self.logger, self.device)
+        return out
 
     def predict_matrix(
             self, 
@@ -417,6 +608,12 @@ class PairwiseCCM:
         """
         if Y_lib_emb is None:
             Y_lib_emb = X_lib_emb
+
+        if isinstance(library_size, (list, tuple, np.ndarray, torch.Tensor)):
+            raise ValueError(
+                "library_size must be a single size; a library-size sweep is only "
+                "available for scoring, through score_matrix_sweep()."
+            )
         if X_pred_emb is None:
             X_pred_emb = X_lib_emb
 
@@ -890,6 +1087,7 @@ class PairwiseCCM:
         metric="corr",
         subtract_global=False,
         batch_size=None,
+        trials=None,
         **kwargs
     ):
         metric_fn = get_metric(metric)
@@ -973,10 +1171,41 @@ class PairwiseCCM:
             raise ValueError("Invalid method. Supported methods are 'simplex' and 'smap'.")
 
         # ---------- 3) size resolution ----------
+        sweep_sizes = None
+        if isinstance(library_size, (list, tuple, np.ndarray, torch.Tensor)):
+            if mode != "score":
+                raise ValueError("A library-size sweep is only supported in 'score' mode.")
+            if method != "simplex":
+                raise ValueError(
+                    "A library-size sweep is only supported for method='simplex'."
+                )
+            sweep_sizes = _as_size_list(library_size)
+
+        if trials is not None:
+            if sweep_sizes is None or mode != "score" or method != "simplex":
+                raise ValueError(
+                    "trials are only vectorised for a simplex library-size sweep."
+                )
+            if int(trials) < 1:
+                raise ValueError("trials must be a positive int.")
+            if subtract_global:
+                raise ValueError(
+                    "subtract_global is not supported with vectorised trials; "
+                    "its baseline is fitted per library, which the stacked "
+                    "source axis does not carry."
+                )
+            trials = int(trials)
+
         if mode == "score":
             # Defaults/auto computed from min_len (not min_len - tp)
             library_size_mode = "explicit"
-            if library_size is None:
+            if sweep_sizes is not None:
+                # One library is drawn at the largest size; every smaller size
+                # reads a prefix of it, which is what `randperm(n)[:L]` already
+                # produces for a fixed seed.
+                library_size_res = max(sweep_sizes)
+                library_size_mode = "sweep"
+            elif library_size is None:
                 library_size_res = min_len
                 library_size_mode = "none->min_len"
             elif library_size == "auto":
@@ -1025,22 +1254,85 @@ class PairwiseCCM:
             self._log_predict_output_allocation(pred_shape, pred_bytes)
 
         # ---------- 4) indices ----------
-        gen_lib = gen_smpl = None
-        if seed is not None:
-            base = int(seed)
-            gen_lib  = torch.Generator(device=self.device).manual_seed(base)
-            gen_smpl = torch.Generator(device=self.device).manual_seed(base + 1)
-            
+        def _draw(offset):
+            """Library and query indices for a run seeded `seed + offset`."""
+            g_lib = g_smpl = None
+            if seed is not None:
+                base = int(seed) + int(offset)
+                g_lib = torch.Generator(device=self.device).manual_seed(base)
+                g_smpl = torch.Generator(device=self.device).manual_seed(base + 1)
+            return g_lib, g_smpl
+
+        gen_lib, gen_smpl = _draw(0)
+
+        trial_layout = None
+        if trials is not None:
+            # Trial `t` draws exactly what `seed + t` drew when trials were a
+            # loop of separate calls, so the vectorised run reproduces it.
+            draws = [_draw(t) for t in range(trials)]
+            lib_rows = [self.__get_random_indices(min_len - tp, library_size_res, g) for g, _ in draws]
+            smpl_rows = [self.__get_random_indices(min_len - tp, sample_size_res, g) for _, g in draws]
+            lib_indices, smpl_indices = lib_rows[0], smpl_rows[0]
+            trial_layout = _TrialLayout(trials, num_ts_X,
+                                        torch.stack(lib_rows), torch.stack(smpl_rows))
+            # One neighbour count per stacked source row.
+            nbrs_num = nbrs_num.repeat(trials)
+
         if mode == "score":
             # Indices are still drawn from the valid (min_len - tp) window, like your original
-            lib_indices  = self.__get_random_indices(min_len - tp, library_size_res, gen_lib)
-            smpl_indices = self.__get_random_indices(min_len - tp, sample_size_res, gen_smpl)
+            if trial_layout is None:
+                lib_indices  = self.__get_random_indices(min_len - tp, library_size_res, gen_lib)
+                smpl_indices = self.__get_random_indices(min_len - tp, sample_size_res, gen_smpl)
+            if sweep_sizes is not None:
+                # `randperm(n)[:L]` silently truncates, so a requested size past
+                # the usable window collapses onto the full library; fold those
+                # duplicates into one computed width and map them back on return.
+                n_lib = int(lib_indices.shape[0])
+                sweep_widths = sorted({min(w, n_lib) for w in sweep_sizes})
+                sweep_take = torch.tensor(
+                    [sweep_widths.index(min(w, n_lib)) for w in sweep_sizes],
+                    device=self.device, dtype=torch.long,
+                )
+                smallest = sweep_widths[0]
+                if smallest < int(nbrs_num.max().item()):
+                    raise ValueError(
+                        f"library size {smallest} is smaller than the neighbor count "
+                        f"{int(nbrs_num.max().item())}; raise the smallest library size "
+                        "or lower `nbrs_num`."
+                    )
+                self.logger.info(
+                    "library_size sweep widths=%s (requested=%s, usable_library=%d)",
+                    str(sweep_widths), str(sweep_sizes), n_lib,
+                )
         else:
             lib_indices  = self.__get_random_indices(min_len_lib - tp, library_size_res, gen_lib)
             smpl_indices = torch.arange(min_len_pred, device=self.device)  # same as original
 
         # ---------- 5) sampling ----------
-        if mode == "score":
+        Y_smp_trials = None
+        if mode == "score" and trial_layout is not None:
+            # Sources stack along the batch axis, one block of `num_ts_X` per
+            # trial. Target libraries stack along the *library* axis instead, so
+            # the flattened gather table stays two-dimensional and a trial's
+            # neighbour columns only need a `t * library_size` offset.
+            X_lib = torch.cat([
+                self.__get_random_sample(X_lib_list, min_len, row, num_ts_X, max_E_X)
+                for row in trial_layout.lib_idx
+            ], dim=0)
+            X_sample = torch.cat([
+                self.__get_random_sample(X_lib_list, min_len, row, num_ts_X, max_E_X)
+                for row in trial_layout.smpl_idx
+            ], dim=0)
+            Y_lib_s = torch.cat([
+                self.__get_random_sample(Y_lib_list, min_len, row + tp, num_ts_Y, max_E_Y)
+                for row in trial_layout.lib_idx
+            ], dim=1)
+            Y_smp_trials = torch.stack([
+                self.__get_random_sample(Y_lib_list, min_len, row + tp, num_ts_Y, max_E_Y)
+                for row in trial_layout.smpl_idx
+            ])
+            Y_smp_s = Y_smp_trials[0]
+        elif mode == "score":
             X_lib    = self.__get_random_sample(X_lib_list, min_len, lib_indices,  num_ts_X, max_E_X)
             X_sample = self.__get_random_sample(X_lib_list, min_len, smpl_indices, num_ts_X, max_E_X)
             Y_lib_s  = self.__get_random_sample(Y_lib_list, min_len, lib_indices + tp,  num_ts_Y, max_E_Y)
@@ -1057,24 +1349,40 @@ class PairwiseCCM:
             auto_batch = (batch_size == "auto")
             nbrs_num_max = nbrs_num.max().item()
             total_samples = int(X_sample.shape[1])
+            # `_simplex_base_bytes` covers neither the streaming accumulators nor
+            # the per-trial copies of the target tensors.
+            dbytes = torch.tensor([], dtype=self.dtype).element_size()
             simplex_extra_base_bytes = 0
             if mode == "score":
-                simplex_extra_base_bytes = int(Y_smp_s.numel() * torch.tensor([], dtype=self.dtype).element_size())
-                # A streamed metric holds its accumulators for the whole call --
-                # three source-wide plus two target-side for `corr`, the widest
-                # of them -- and they are promoted to float64 on CPU. Nothing in
-                # `_simplex_base_bytes` covers that, so without this the budget
-                # runs over by their size: 381MB at 1000x1000 sources/targets
-                # with E_y=10, which is the regime the budget exists to protect.
+                simplex_extra_base_bytes = int(Y_smp_s.numel() * dbytes)
+            else:
+                simplex_extra_base_bytes = int(predict_output_bytes)
+            if mode == "score":
+                n_w = len(sweep_widths) if sweep_sizes is not None else 1
+                n_t = trials or 1
+                stacked = int(num_ts_X) * n_w * n_t
+                # Target-side width: one column when the target is shared
+                # across the whole axis, one per (width, trial) when grouped.
+                groups = 1 if trial_layout is None else n_w * n_t
                 if get_streaming_metric_kind(metric_fn) is not None:
                     acc_bytes = torch.tensor(
                         [], dtype=_corr_accum_dtype(self.compute_dtype, self.device)
                     ).element_size()
+                    # Three source-wide accumulators plus two target-side ones.
                     simplex_extra_base_bytes += int(
-                        (3 * num_ts_X + 2) * max_E_Y * num_ts_Y * acc_bytes
+                        (3 * stacked + 2 * groups) * max_E_Y * num_ts_Y * acc_bytes
                     )
-            else:
-                simplex_extra_base_bytes = int(predict_output_bytes)
+                if trial_layout is not None:
+                    counted = int(num_ts_Y) * int(library_size_res) * int(max_E_Y)
+                    cbytes = torch.tensor([], dtype=self.compute_dtype).element_size()
+                    # Target library and its flattened copy now span every trial.
+                    simplex_extra_base_bytes += int(
+                        max(Y_lib_s.numel() - counted, 0) * (dbytes + cbytes)
+                    )
+                    # And the query targets are held per trial.
+                    simplex_extra_base_bytes += int(
+                        max(Y_smp_trials.numel() - Y_smp_s.numel(), 0) * dbytes
+                    )
             if auto_batch:
                 batch_size, batch_auto_meta = auto_batch_size_simplex(
                     X_lib, X_sample, Y_lib_s, nbrs_num_max,
@@ -1083,6 +1391,7 @@ class PairwiseCCM:
                     budget_gb=self.memory_budget_gb,
                     target_batch_size=target_batch_size,
                     extra_base_bytes=simplex_extra_base_bytes,
+                    num_widths=(len(sweep_widths) if sweep_sizes is not None else 1),
                 )
             else:
                 _, batch_auto_meta = auto_batch_size_simplex(
@@ -1092,6 +1401,7 @@ class PairwiseCCM:
                     budget_gb=self.memory_budget_gb,
                     target_batch_size=target_batch_size,
                     extra_base_bytes=simplex_extra_base_bytes,
+                    num_widths=(len(sweep_widths) if sweep_sizes is not None else 1),
                 )
             if batch_size is not None and batch_size <= 0:
                 raise ValueError("batch_size must be positive, 'auto', or None.")
@@ -1121,6 +1431,9 @@ class PairwiseCCM:
                 return_pred=return_pred, sample_batch_size=batch_size,
                 nbrs_num_max=int(nbrs_num_max),
                 target_batch_size=selected_target_batch_size,
+                library_widths=(sweep_widths if sweep_sizes is not None else None),
+                trial_layout=trial_layout,
+                Y_sample_trials=Y_smp_trials,
             )
 
 
@@ -1186,18 +1499,40 @@ class PairwiseCCM:
 
         if subtract_global:
             self.logger.info("Subtracting global linear baseline from %s output", mode)
-            global_out = self.__global_linear_output(
-                X_lib,
-                X_sample,
-                Y_lib_s,
-                Y_smp_s,
-                x_dims=x_dims,
-                metric_fn=metric_fn,
-                ridge=global_ridge,
-                sample_batch_size=batch_size,
-                return_pred=return_pred,
-            )
+            if sweep_sizes is not None:
+                # The baseline is fitted on the library, so it moves with the
+                # width; the library prefixes are the same ones the sweep used.
+                global_out = torch.stack([
+                    self.__global_linear_output(
+                        X_lib[:, :w],
+                        X_sample,
+                        Y_lib_s[:, :w],
+                        Y_smp_s,
+                        x_dims=x_dims,
+                        metric_fn=metric_fn,
+                        ridge=global_ridge,
+                        sample_batch_size=batch_size,
+                        return_pred=return_pred,
+                    )
+                    for w in sweep_widths
+                ])
+            else:
+                global_out = self.__global_linear_output(
+                    X_lib,
+                    X_sample,
+                    Y_lib_s,
+                    Y_smp_s,
+                    x_dims=x_dims,
+                    metric_fn=metric_fn,
+                    ridge=global_ridge,
+                    sample_batch_size=batch_size,
+                    return_pred=return_pred,
+                )
             out = out - global_out.to(device=out.device, dtype=out.dtype)
+
+        if sweep_sizes is not None:
+            axis = 0 if trial_layout is None else 1
+            out = out.index_select(axis, sweep_take.to(out.device))
 
         return out
 
@@ -1205,8 +1540,19 @@ class PairwiseCCM:
     def __simplex_prediction(self, lib_indices, smpl_indices,
                               X_lib, X_sample, Y_lib_shifted, Y_sample_shifted, 
                               exclusion_rad, nbrs_num, metric_fn, return_pred=False, sample_batch_size=None,
-                              nbrs_num_max=None, target_batch_size=None):
-        num_ts_X = X_lib.shape[0]
+                              nbrs_num_max=None, target_batch_size=None, library_widths=None,
+                              trial_layout=None, Y_sample_trials=None):
+        num_src_ts = X_lib.shape[0]
+        # Widths stack onto the source axis; the target tables are built against
+        # the full library, so a width needs no re-indexing.
+        sweep = library_widths is not None
+        n_widths = len(library_widths) if sweep else 1
+        num_ts_X = num_src_ts * n_widths
+        # With trials vectorised, `num_src_ts` already covers (trial, source) and
+        # each trial's neighbour columns index its own slice of the target table.
+        n_trials = 1 if trial_layout is None else trial_layout.trials
+        per_trial_src = num_src_ts if trial_layout is None else trial_layout.sources
+        lib_span = int(Y_lib_shifted.shape[1]) // n_trials
         num_ts_Y = Y_lib_shifted.shape[0]
         max_E_Y = Y_lib_shifted.shape[2]
         subsample_size = X_sample.shape[1]
@@ -1220,10 +1566,11 @@ class PairwiseCCM:
 
         lib_index = self._prepare_nbr_library(X_lib)
         self.logger.debug(
-            "Entering simplex backend (queries=%d, library_points=%d, num_sources=%d, num_targets=%d, Ey=%d, nbrs_max=%d, batch_size=%d, num_batches=%d, target_batch_size=%d, num_target_batches=%d, exclusion=%s)",
+            "Entering simplex backend (queries=%d, library_points=%d, num_sources=%d, num_widths=%d, num_targets=%d, Ey=%d, nbrs_max=%d, batch_size=%d, num_batches=%d, target_batch_size=%d, num_target_batches=%d, exclusion=%s)",
             int(subsample_size),
             int(X_lib.shape[1]),
-            int(num_ts_X),
+            int(num_src_ts),
+            int(n_widths),
             int(num_ts_Y),
             int(max_E_Y),
             int(nbrs_num_max),
@@ -1243,7 +1590,8 @@ class PairwiseCCM:
                 num_ts_X,
                 device=self.device,
                 dtype=self.compute_dtype,
-                shared_target=True,
+                shared_target=(trial_layout is None),
+                target_group=(1 if trial_layout is None else per_trial_src),
             )
 
         # Keep full output off accelerator in score mode so device memory tracks batch size.
@@ -1251,15 +1599,30 @@ class PairwiseCCM:
         # Flatten target features once so per-batch gathers can use index_select on a
         # dense 2D table instead of slower advanced indexing over a 3D tensor.
         Y_lib_flat = Y_lib_shifted.to(self.compute_dtype).permute(1, 0, 2).reshape(
-            X_lib.shape[1], num_ts_Y * max_E_Y
+            Y_lib_shifted.shape[1], num_ts_Y * max_E_Y
         ).contiguous()
+        # Row (width, trial, source) of the stacked axis reads trial `t`'s block
+        # of that table, so its neighbour columns shift by `t * lib_span`.
+        col_shift = None
+        if trial_layout is not None:
+            rows = torch.arange(num_ts_X, device=self.device)
+            col_shift = (((rows // per_trial_src) % n_trials) * lib_span).reshape(-1, 1, 1)
+            trial_of_col = (rows // per_trial_src) % n_trials
+            # One target column per group of sources rather than per source:
+            # the streaming metric broadcasts it across the group, so the
+            # target-side reductions stay `sources` times narrower.
+            trial_of_group = torch.arange(
+                num_ts_X // per_trial_src, device=self.device
+            ) % n_trials
         target_ranges = tuple(
             (y0, min(num_ts_Y, y0 + target_batch_size))
             for y0 in range(0, num_ts_Y, target_batch_size)
         )
         max_target_block_width = int(target_batch_size * max_E_Y)
         # Only the gather + `bmm` path needs the k-fold staging buffers.
-        if self._use_fused_reduce(nbrs_num_max, max_target_block_width):
+        if self._use_fused_reduce(
+            nbrs_num_max, max_target_block_width, rows=num_ts_X * sample_batch_size
+        ):
             gather_buf = None
             reduce_buf = None
             bag_offsets = torch.arange(
@@ -1280,6 +1643,17 @@ class PairwiseCCM:
             )
         #nbrs_mask = (torch.arange(nbrs_num_max).unsqueeze(0) < nbrs_num.unsqueeze(1))
         A = None if stream_kind is not None else torch.empty((subsample_size, max_E_Y, num_ts_Y, num_ts_X), device=out_device, dtype=self.dtype)
+        if sweep and A is not None:
+            # A metric that cannot stream needs every query of a width before it
+            # can score, so the stored block carries all widths at once. The
+            # streaming metrics keep accumulators instead and do not pay this.
+            self.logger.log(
+                logging.WARNING if A.numel() * A.element_size() >= self._predict_warning_threshold_bytes()
+                else logging.INFO,
+                "Sweep prediction block spans %d widths: shape=%s approx=%s on %s. "
+                "A streaming metric (corr, mse, rmse, mae, neg_nrmse) keeps only accumulators.",
+                n_widths, str(tuple(A.shape)), format_bytes(A.numel() * A.element_size()), str(out_device),
+            )
         for s0 in batch_starts(self.logger, subsample_size, sample_batch_size, "simplex batches"):
             s1 = min(subsample_size, s0 + sample_batch_size)
             self.logger.debug(
@@ -1294,9 +1668,16 @@ class PairwiseCCM:
                     X_sample_b = X_sample[:, s0:s1, :].to(device=self.device, dtype=self.dtype, copy=False)
                     weights, indices = self.__get_nbrs_indices_with_weights(
                         X_lib, X_sample_b,
-                        nbrs_num, nbrs_num_max, lib_indices, smpl_indices[s0:s1],
-                        exclusion_rad, lib_index=lib_index
+                        nbrs_num, nbrs_num_max,
+                        lib_indices if trial_layout is None else trial_layout.lib_idx,
+                        smpl_indices[s0:s1] if trial_layout is None
+                        else trial_layout.smpl_idx[:, s0:s1],
+                        exclusion_rad, lib_index=lib_index,
+                        library_widths=library_widths,
+                        trial_layout=trial_layout,
                     )
+                    if col_shift is not None:
+                        indices = indices + col_shift
             except RuntimeError as e:
                 if is_oom_error(e):
                     self.logger.warning("OOM in simplex batch [%d:%d): %s", int(s0), int(s1), str(e))
@@ -1312,9 +1693,15 @@ class PairwiseCCM:
             batch_rows = int(num_ts_X * batch_queries)
             Y_sample_batch_view = None
             if stream_kind is not None:
-                Y_sample_batch_view = Y_sample_shifted[:, s0:s1, :].permute(1, 2, 0).to(
-                    device=self.device, dtype=self.compute_dtype
-                ).contiguous()
+                if trial_layout is None:
+                    Y_sample_batch_view = Y_sample_shifted[:, s0:s1, :].permute(1, 2, 0).to(
+                        device=self.device, dtype=self.compute_dtype
+                    ).contiguous()
+                else:
+                    # (trials, targets, queries, E) -> (queries, E, targets, trials)
+                    Y_sample_batch_view = Y_sample_trials[:, :, s0:s1, :].permute(2, 3, 1, 0).to(
+                        device=self.device, dtype=self.compute_dtype
+                    ).contiguous()
             gather_ms = 0.0
             weighted_avg_ms = 0.0
             metric_ms = 0.0
@@ -1322,8 +1709,12 @@ class PairwiseCCM:
             for y0, y1 in target_ranges:
                 y_width = (y1 - y0) * max_E_Y
 
+                # Decide on the full batch's row count, not this batch's: the
+                # staging buffers are sized for `sample_batch_size`, and a
+                # partial last batch must not flip the choice and look for a
+                # buffer that was never allocated.
                 fused = bag_offsets is not None and self._use_fused_reduce(
-                    nbrs_num_max, y_width
+                    nbrs_num_max, y_width, rows=num_ts_X * sample_batch_size
                 )
 
                 t_part = tic(self.logger, self.device) if self._debug_enabled() else None
@@ -1371,9 +1762,12 @@ class PairwiseCCM:
 
                 if stream_kind is not None:
                     t_part = tic(self.logger, self.device) if self._debug_enabled() else None
-                    B_y = Y_sample_batch_view[:, :, y0:y1].unsqueeze(-1).expand(
-                        batch_queries, max_E_Y, y1 - y0, num_ts_X
-                    )
+                    if trial_layout is None:
+                        B_y = Y_sample_batch_view[:, :, y0:y1].unsqueeze(-1).expand(
+                            batch_queries, max_E_Y, y1 - y0, num_ts_X
+                        )
+                    else:
+                        B_y = Y_sample_batch_view[:, :, y0:y1, :].index_select(3, trial_of_group)
                     stream_metric_state_update(
                         stream_kind,
                         stream_state,
@@ -1415,22 +1809,43 @@ class PairwiseCCM:
 
             del weights, indices, weights_c, flat_indices, weights_rows, weights_flat, Y_sample_batch_view
 
+        def unstack(scores):
+            """
+            Split the combined source axis back out as a leading width axis.
+
+            Only the last axis is touched: `neg_nrmse` reduces over the target
+            dimension, so the leading shape is the metric's to decide.
+            """
+            if not sweep:
+                return scores
+            if trial_layout is None:
+                return scores.reshape(*scores.shape[:-1], n_widths, num_src_ts).movedim(-2, 0)
+            # (..., width, trial, source) -> (trial, width, ..., source)
+            split = scores.reshape(*scores.shape[:-1], n_widths, n_trials, per_trial_src)
+            return split.movedim(-2, 0).movedim(-2, 1)
+
         if stream_kind is not None:
-            return stream_metric_state_finalize(stream_kind, stream_state)
+            return unstack(stream_metric_state_finalize(stream_kind, stream_state))
 
         if (Y_sample_shifted is None) and return_pred:
+            # Prediction output; a sweep is rejected upstream, so n_widths == 1.
             return A
 
         self.logger.debug("Computing simplex score metric")
-        B = torch.permute(Y_sample_shifted, (1, 2, 0)).to(device=A.device, dtype=self.compute_dtype)[:, :, :, None] \
-            .expand(Y_sample_shifted.shape[1], max_E_Y, num_ts_Y, num_ts_X)
+        if trial_layout is None:
+            B = torch.permute(Y_sample_shifted, (1, 2, 0)).to(device=A.device, dtype=self.compute_dtype)[:, :, :, None] \
+                .expand(Y_sample_shifted.shape[1], max_E_Y, num_ts_Y, num_ts_X)
+        else:
+            B = Y_sample_trials.permute(2, 3, 1, 0).to(
+                device=A.device, dtype=self.compute_dtype
+            ).index_select(3, trial_of_col.to(A.device))
 
         r_AB = metric_fn(A.to(dtype=self.compute_dtype), B)
 
         if return_pred:
-            return (r_AB, A)
+            return (unstack(r_AB), A)
         else:
-            return r_AB
+            return unstack(r_AB)
 
     @torch.inference_mode()
     def __smap_prediction(self, lib_indices, smpl_indices, X_lib, X_sample, Y_lib_shifted, Y_sample_shifted,
@@ -1827,14 +2242,21 @@ class PairwiseCCM:
     # under it with margin.
     _BMM_FAST_ELEMS = 384
 
-    def _use_fused_reduce(self, nbrs_num_max, y_width):
+    # The staging block the `bmm` path materializes is (rows, k, y_width), so it
+    # also grows with the row count -- which a library-size sweep multiplies by
+    # the number of widths. Once it is this far past cache, allocating and
+    # streaming it costs more than `bmm`'s per-row advantage saves.
+    _BMM_STAGING_MAX_BYTES = 64 * 1024 * 1024
+
+    def _use_fused_reduce(self, nbrs_num_max, y_width, rows=None):
         """
         Whether to run the simplex weighted average through `embedding_bag`
         instead of gather + `bmm`.
 
         The fused path folds the neighbor gather into the weighted sum, so it
         never materializes the (rows, k, y_width) block. Below the threshold
-        `bmm` is still the faster of the two.
+        `bmm` is still the faster of the two, unless `rows` is given and that
+        block would be far larger than cache.
 
         CUDA has no width cliff, but skipping the k-fold intermediate pays
         there too, and the target axis is left unsplit on CUDA so the width
@@ -1843,7 +2265,15 @@ class PairwiseCCM:
         """
         if not self.device.startswith(("cpu", "cuda")):
             return False
-        return int(nbrs_num_max) * int(y_width) > self._BMM_FAST_ELEMS
+        if int(nbrs_num_max) * int(y_width) > self._BMM_FAST_ELEMS:
+            return True
+        if rows is None:
+            return False
+        staging_bytes = (
+            int(rows) * int(nbrs_num_max) * int(y_width)
+            * torch.tensor([], dtype=self.compute_dtype).element_size()
+        )
+        return staging_bytes > self._BMM_STAGING_MAX_BYTES
 
     def _release_nbr_workspace(self):
         self._nbr_workspace = {}
@@ -1877,10 +2307,17 @@ class PairwiseCCM:
 
     def __get_nbrs_indices_with_weights(
         self, lib, sample, n_nbrs, n_nbrs_max, lib_idx, sample_idx, exclusion_rad,
-        lib_index=None,
+        lib_index=None, library_widths=None, trial_layout=None,
     ):
         """
         Weights and library indices of each query's k nearest neighbors.
+
+        With `library_widths` (ascending, each <= the library length) the search
+        runs once against the full library and the widths are stacked onto the
+        source axis, so the result is `(n_widths * n_sources, queries, k)` with
+        width as the outer part of that axis. Temporal exclusion depends only on
+        the library and query time indices, never on the width, so masking the
+        full block once is valid for every prefix.
 
         Note: the returned tensors alias per-instance workspaces and stay valid
         only until the next call, which both callers respect by consuming them
@@ -1901,15 +2338,23 @@ class PairwiseCCM:
             raise
 
         with time_block(self.logger, self.device, timings, "select"):
-            if exclusion_rad is not None and not self.__exclude_narrow(dist, lib_idx, sample_idx, exclusion_rad):
-                # Keep the broadcast intermediates boolean. Subtracting int64
-                # indices would materialize an 8-byte (samples x library) tensor.
-                allowed = (
-                    (lib_idx[None, :] > (sample_idx[:, None] + exclusion_rad)) |
-                    (lib_idx[None, :] < (sample_idx[:, None] - exclusion_rad))
+            if exclusion_rad is not None:
+                if trial_layout is None:
+                    self.__exclude(dist, lib_idx, sample_idx, exclusion_rad)
+                else:
+                    # Each trial drew its own library and queries, so its block of
+                    # the source axis carries its own excluded columns.
+                    per_trial = trial_layout.sources
+                    for t in range(trial_layout.trials):
+                        self.__exclude(dist[t * per_trial:(t + 1) * per_trial],
+                                       lib_idx[t], sample_idx[t], exclusion_rad)
+            if library_widths is not None:
+                near_dist, indices = self.__sweep_topk(
+                    dist, library_widths, n_nbrs_max, squared=(lib_index is not None)
                 )
-                dist.masked_fill_(~allowed.unsqueeze(0), float("inf"))
-            if lib_index is None:
+                # One k per source per width, matching the stacked source axis.
+                n_nbrs = n_nbrs.repeat(len(library_widths))
+            elif lib_index is None:
                 near_dist, indices = torch.topk(dist, n_nbrs_max, largest=False, sorted=False)
             else:
                 chunk = self._prefilter_chunk(n_nbrs_max, dist.shape[2])
@@ -1930,6 +2375,18 @@ class PairwiseCCM:
             timings["total"] = sum(v for v in timings.values())
             self.logger.debug("Neighbor search timings: %s", timings_summary(timings, ["cdist", "select", "weights", "total"]))
         return weights, indices
+
+    def __exclude(self, dist, lib_idx, sample_idx, exclusion_rad):
+        """Mask the temporally excluded library columns of one distance block."""
+        if self.__exclude_narrow(dist, lib_idx, sample_idx, exclusion_rad):
+            return
+        # Keep the broadcast intermediates boolean. Subtracting int64
+        # indices would materialize an 8-byte (samples x library) tensor.
+        allowed = (
+            (lib_idx[None, :] > (sample_idx[:, None] + exclusion_rad)) |
+            (lib_idx[None, :] < (sample_idx[:, None] - exclusion_rad))
+        )
+        dist.masked_fill_(~allowed.unsqueeze(0), float("inf"))
 
     # Random-access cost of the scatter path is roughly one cache line per
     # touched element, so it only beats a streaming pass over the block while
@@ -2037,6 +2494,55 @@ class PairwiseCCM:
             values, pick = values.topk(k, dim=2, largest=False, sorted=False)
             cols = cols.gather(2, pick)
         return values, cols
+
+    def __slab_topk(self, block, k):
+        """k smallest of one library slab, through the prefilter when it pays."""
+        chunk = self._prefilter_chunk(k, block.shape[2])
+        if chunk:
+            return self.__prefilter_topk(block, k, chunk)
+        return torch.topk(block, k, dim=2, largest=False, sorted=False)
+
+    def __sweep_topk(self, dist, widths, k, *, squared):
+        """
+        k nearest within each library prefix `dist[..., :w]`, `widths` ascending,
+        stacked onto the source axis as `(len(widths) * n_sources, queries, k)`.
+
+        Prefixes are nested, so the k smallest over `w` are the k smallest of the
+        previous winners together with the columns that `w` adds -- anything
+        beaten by k values in a prefix stays beaten in every longer one. Each
+        column is therefore scanned once for the whole sweep rather than once per
+        width, leaving only a (k + delta) merge per step.
+
+        Stacking rather than returning a per-width list lets the weights, the
+        reduction and the metric run once over a wider source axis instead of
+        once per width, which is where the per-width dispatch cost was going.
+        Width is the outer part of the combined axis, so the caller recovers
+        `(width, source)` with a reshape.
+
+        Ties break arbitrarily, as they do in `topk`, so a merged selection can
+        name a different member of a tie than a flat `topk` over the prefix.
+        """
+        n_x, n_q, _ = dist.shape
+        n_w = len(widths)
+        vals = self.__workspace("sweep_vals", (n_w, n_x, n_q, k), dist.dtype)
+        cols = self.__workspace("sweep_cols", (n_w, n_x, n_q, k), torch.long)
+        prev = 0
+        for wi, w in enumerate(widths):
+            new_vals, new_cols = self.__slab_topk(dist[..., prev:w], min(k, w - prev))
+            if wi == 0:
+                vals[wi] = new_vals
+                cols[wi] = new_cols
+            else:
+                merged, pick = torch.cat([vals[wi - 1], new_vals], dim=2).topk(
+                    k, dim=2, largest=False, sorted=False
+                )
+                vals[wi] = merged
+                cols[wi] = torch.cat([cols[wi - 1], new_cols + prev], dim=2).gather(2, pick)
+            prev = w
+        vals = vals.reshape(n_w * n_x, n_q, k)
+        if squared:
+            vals.clamp_min_(0).sqrt_()
+        return vals, cols.reshape(n_w * n_x, n_q, k)
 
     def __squared_euclidean_dist(self, sample, lib_index):
         """
