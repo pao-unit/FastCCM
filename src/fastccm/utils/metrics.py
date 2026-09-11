@@ -55,10 +55,12 @@ def batch_rmse(A: torch.Tensor, B: torch.Tensor, eps: float = 1e-12) -> torch.Te
 def batch_neg_nrmse(A: torch.Tensor, B: torch.Tensor,
                                  T: float = 0.5, eps: float = 1e-12) -> torch.Tensor:
     """
-    Multivariate version: normalize RMSE across both samples (S) and features (D)
-    for each spatial location (y,x).
+    Exponentiated normalized squared error across samples (S) and features (D).
+    The baseline predicts each feature's sample mean separately at each (y,x).
+    This preserves variance weighting and invariance to a shared translation
+    and full orthogonal feature transform (including PCA without whitening).
     A,B: [S, D, Y, X]
-    Returns: [D, Y, X] (value is identical along D for each (y,x))
+    Returns: [1, Y, X]
     """
     T_t  = torch.tensor(T,  dtype=A.dtype, device=A.device)
     eps_t = torch.tensor(eps, dtype=A.dtype, device=A.device)
@@ -66,8 +68,8 @@ def batch_neg_nrmse(A: torch.Tensor, B: torch.Tensor,
     mse  = (A - B).pow(2).mean(dim=(0, 1))              # [Y, X]
     rmse = torch.sqrt(mse + eps_t)                         # [Y, X]
 
-    # Baseline: RMSE(mean over S, over D), i.e., std of B over (S, D)
-    muB  = B.mean(dim=(0, 1), keepdim=True)             # [1, 1, Y, X]
+    # Baseline: each feature's mean over samples.
+    muB  = B.mean(dim=0, keepdim=True)                 # [1, D, Y, X]
     varB = (B - muB).pow(2).mean(dim=(0, 1))            # [Y, X]
     rmse_base = torch.sqrt(varB + eps_t)                  # [Y, X]
 
@@ -189,11 +191,11 @@ def stream_metric_state_init(kind: str, D, Y, X, *, device, dtype, shared_target
         shape_yx = (Y, X)
         z_yx = torch.zeros(shape_yx, device=device, dtype=dtype)
         target_x = 1 if shared_target else X
-        z_yb = torch.zeros((Y, target_x), device=device, dtype=dtype)
+        z_dyb = torch.zeros((D, Y, target_x), device=device, dtype=dtype)
         state.update({
             "sum_sq_err_sd": z_yx.clone(),  # over S and D
-            "sumB_sd": z_yb.clone(),        # over S and D
-            "sumBB_sd": z_yb.clone(),       # over S and D
+            "meanB": z_dyb.clone(),         # per-feature sample mean
+            "m2B": z_dyb.clone(),           # centered sum of squares over S
         })
         return state
     raise ValueError(f"Unsupported streaming metric kind: {kind}")
@@ -272,12 +274,22 @@ def stream_metric_state_update(kind: str, state, A_blk, B_blk, *, y_start: int =
         state["sum_abs_err"][dyx] += (A_blk - B_blk).abs().sum(dim=0)
         return
     if kind == "neg_nrmse":
+        block_n = int(A_blk.shape[0])
+        if block_n == 0:
+            return
         d = A_blk - B_blk
         state["sum_sq_err_sd"][yx] += (d * d).sum(dim=(0, 1))
         if state.get("shared_target", False):
             B_blk = B_blk[..., :1]
-        state["sumB_sd"][y1] += B_blk.sum(dim=(0, 1))
-        state["sumBB_sd"][y1] += (B_blk * B_blk).sum(dim=(0, 1))
+        block_mean = B_blk.mean(dim=0)
+        centered = B_blk - block_mean.unsqueeze(0)
+        delta = block_mean - state["meanB"][dy1]
+        old_n = state["n"] - block_n
+        # Merge centered moments over all sample chunks, retaining variation
+        # between chunk means. Target tiles share the same total sample count.
+        state["m2B"][dy1] += (centered.square().sum(dim=0)
+                              + delta.square() * (old_n * block_n / state["n"]))
+        state["meanB"][dy1] += delta * (block_n / state["n"])
         return
     raise ValueError(f"Unsupported streaming metric kind: {kind}")
 
@@ -312,8 +324,7 @@ def stream_metric_state_finalize(kind: str, state, *, eps=1e-12, neg_nrmse_T=0.5
         cnt_t = torch.tensor(float(n * D), device=device, dtype=out_dtype)
         mse = state["sum_sq_err_sd"] / cnt_t
         rmse = torch.sqrt(mse + eps_t)
-        muB = state["sumB_sd"] / cnt_t
-        varB = (state["sumBB_sd"] / cnt_t) - (muB * muB)
+        varB = state["m2B"].sum(dim=0) / cnt_t
         rmse_base = torch.sqrt(varB.clamp_min(0.0) + eps_t)
         T_t = torch.tensor(neg_nrmse_T, device=device, dtype=out_dtype)
         out = torch.exp(-((1.0 / T_t) * torch.pow(rmse / (rmse_base + eps_t), 2)))
