@@ -1,4 +1,5 @@
 # src/fastccm/__init__.py
+from importlib import import_module
 from importlib.metadata import version, PackageNotFoundError
 from typing import TYPE_CHECKING
 from ._version import __version__
@@ -26,10 +27,6 @@ def __getattr__(name: str):
     if name == "Functions":
         from .ccm_utils import Functions
         return Functions
-    if name == "data":
-        from . import data as data_module
-        return data_module
-    if name == "utils":
-        from . import utils as utils_module
-        return utils_module
+    if name in ("data", "utils"):
+        return import_module(f".{name}", __name__)
     raise AttributeError(f"module 'fastccm' has no attribute {name!r}")
