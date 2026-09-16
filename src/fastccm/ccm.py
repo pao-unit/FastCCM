@@ -2070,15 +2070,29 @@ class PairwiseCCM:
     def __weights_from_dists(self, near_dist, indices, n_nbrs, n_nbrs_max):
         timings = {}
         eps = torch.finfo(near_dist.dtype).eps
+        # Uniform k (the default, nbrs_num = E_x + 1 over equal-width sources)
+        # keeps every column, so the mask is only needed when it can drop one.
+        trim = int(n_nbrs.min()) < n_nbrs_max
+
+        if trim:
+            # The selection arrives from `topk(..., sorted=False)` in no
+            # defined order, so dropping all but the leading n_nbrs columns
+            # would keep an arbitrary subset rather than the n_nbrs nearest.
+            # When the true nearest falls outside them every surviving weight
+            # is exp(-d/d0) at d >> d0, which underflows to zero and trips the
+            # all-excluded check below. Order the k axis first; it is short,
+            # and the uniform-k path skips this entirely.
+            with time_block(self.logger, self.device, timings, "sort"):
+                near_dist, order = near_dist.sort(dim=2)
+                indices = indices.gather(2, order)
+
         with time_block(self.logger, self.device, timings, "exp"):
             d0 = near_dist.amin(dim=2, keepdim=True).clamp_min(eps)
             w = near_dist.div(d0).neg_().exp_()
             w.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
 
         with time_block(self.logger, self.device, timings, "mask"):
-            # Uniform k (the default, nbrs_num = E_x + 1 over equal-width sources)
-            # keeps every column, so the mask is only built when it can drop one.
-            if int(n_nbrs.min()) < n_nbrs_max:
+            if trim:
                 keep = (torch.arange(n_nbrs_max, device=w.device).unsqueeze(0) < n_nbrs.unsqueeze(1))
                 w.mul_(keep[:, None, :].to(w.dtype))
 
@@ -2087,15 +2101,16 @@ class PairwiseCCM:
             zero = sumw <= eps
             if zero.any():
                 raise RuntimeError(
-                    "All neighbors excluded by `exclusion_window` for some queries. "
-                    "Reduce `exclusion_window`, increase `library_size`, or ensure the "
-                    "library contains valid neighbors."
+                    "No usable neighbors for some queries. Every candidate was "
+                    "either excluded by `exclusion_window` or non-finite. Reduce "
+                    "`exclusion_window`, increase `library_size`, or check the "
+                    "embeddings for NaN/inf values."
                 )
             out = w.div_(sumw.clamp_min(eps)).to(self.dtype)
 
         if self._debug_enabled():
             timings["total"] = sum(v for v in timings.values())
-            self.logger.debug("Neighbor weight timings: %s", timings_summary(timings, ["exp", "mask", "normalize", "total"]))
+            self.logger.debug("Neighbor weight timings: %s", timings_summary(timings, ["sort", "exp", "mask", "normalize", "total"]))
         return out, indices
 
 
