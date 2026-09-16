@@ -25,14 +25,34 @@ def _double_center(D: torch.Tensor) -> torch.Tensor:
     return D - mr - mc + ma
 
 
+def _nan_on_constant(r: torch.Tensor, ssA: torch.Tensor, ssB: torch.Tensor) -> torch.Tensor:
+    """Report NaN where a channel is constant, instead of a clean 0.
+
+    Correlation against a constant is undefined. Targets narrower than the
+    widest one in the call are zero-padded, so their padded dimensions are
+    constant zero in both the prediction and the target: 0/0. The `eps` in the
+    denominator resolves that to exactly 0.0, which `np.nanmean` over the
+    dimension axis then averages in as though it were a real score of zero,
+    silently deflating every target whose E is below the maximum. NaN is what
+    callers already expect for an absent dimension -- `nanmean` skips it and
+    `Visualizer.plot_convergence_test` counts dimensions with `np.isnan`.
+
+    `ssA`/`ssB` are sums of squared deviations, so they are >= 0 and only a
+    genuinely constant channel reaches 0.
+    """
+    return r.masked_fill((ssA <= 0) | (ssB <= 0), float("nan"))
+
+
 def batch_corr(A: torch.Tensor, B: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
     # Pearson r across sample axis, keep [D,Y,X]
     eps_t = torch.tensor(eps, dtype=A.dtype, device=A.device)
     muA = A.mean(dim=0, keepdim=True)
     muB = B.mean(dim=0, keepdim=True)
     num = ((A - muA) * (B - muB)).sum(dim=0)
-    den = torch.sqrt(((A - muA).pow(2)).sum(dim=0) * ((B - muB).pow(2)).sum(dim=0) + eps_t)
-    return (num / den).clamp(-1.0, 1.0)
+    ssA = ((A - muA).pow(2)).sum(dim=0)
+    ssB = ((B - muB).pow(2)).sum(dim=0)
+    den = torch.sqrt(ssA * ssB + eps_t)
+    return _nan_on_constant((num / den).clamp(-1.0, 1.0), ssA, ssB)
 
 
 def batch_mse(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
@@ -312,8 +332,11 @@ def stream_metric_state_finalize(kind: str, state, *, eps=1e-12, neg_nrmse_T=0.5
             num = state["sumAB"] - (state["sumA"] * state["sumB"] / n_t)
             denA = state["sumAA"] - (state["sumA"] * state["sumA"] / n_t)
             denB = state["sumBB"] - (state["sumB"] * state["sumB"] / n_t)
-        den = torch.sqrt(denA.clamp_min(0.0) * denB.clamp_min(0.0) + eps_t)
-        return (num / den).clamp(-1.0, 1.0).to(dtype=out_dtype)
+        denA = denA.clamp_min(0.0)
+        denB = denB.clamp_min(0.0)
+        den = torch.sqrt(denA * denB + eps_t)
+        out = _nan_on_constant((num / den).clamp(-1.0, 1.0), denA, denB)
+        return out.to(dtype=out_dtype)
     if kind == "mse":
         return state["sum_sq_err"] / n_t
     if kind == "rmse":
