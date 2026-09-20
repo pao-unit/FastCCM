@@ -488,119 +488,184 @@ class Functions:
         }
 
     def find_optimal_embedding_params(
-            self, 
-            x, 
-            y=None, 
-            library_size="auto", 
-            sample_size="auto", 
-            exclusion_window=0, 
-            E_range=np.arange(1,10,1), 
-            tau_range=np.arange(1,10,1), 
-            tp_range=np.arange(1,2,1),
-            method="simplex", 
-            trials=3, 
+            self,
+            x,
+            y=None,
+            library_size="auto",
+            sample_size="auto",
+            exclusion_window=0,
+            E_range=np.arange(1, 10),
+            tau_range=np.arange(1, 10),
+            tp_range=np.arange(1, 2),
+            method="simplex",
+            trials=3,
             seed=None,
             metric="corr",
+            series_batch_size="auto",
             **kwargs
     ):
-        """
-        Grid-search (E, τ) for CCM by building delay embeddings of x for each (E, τ).
+        """Search embedding parameters independently for one or more series.
 
-        Parameters:
-            x : np.ndarray
-                Source scalar time series (1D).
-            y : np.ndarray or None, optional
-                Target scalar time series (1D). If None, uses x.
-            library_size : int | "auto" | None, optional
-                Number of library points for CCM. See PairwiseCCM for defaults.
-            sample_size : int | "auto" | None, optional
-                Number of query points for scoring. See PairwiseCCM for defaults.
-            exclusion_window : int, optional
-                Theiler window (minimum temporal gap). Default: 0.
-            E_range : array-like of int, optional
-                Embedding dimensions to test. Default: np.arange(1, 10).
-            tau_range : array-like of int, optional
-                Time delays to test. Default: np.arange(1, 10).
-            tp_range : array-like of int, optional
-                Prediction intervals used to form Y targets. Default: np.arange(1, 2).
-                If legacy `tp_max` is provided in `kwargs`, this becomes
-                np.arange(1, tp_max + 1).
-            method : {"simplex", "smap"}, optional
-                Local regressor. Default: "simplex".
-            trials : int, optional
-                Number of repeated runs per (E, τ) to average results. Default: 10.
-            seed : int or None, optional
-                Base seed for reproducible random sampling. For trial t, the seed passed
-                to X→Y is (seed + t) and to Y→X is (seed + t + 10000). If None, sampling
-                is non-deterministic.
-            metric : {"corr","mse","rmse","neg_nrmse","dcorr"} or Callable, optional
-                Scoring function applied to (prediction, target). If a string, one of the
-                built-ins. If a callable, it must accept (A, B) with shapes
-                [S, E_y, n_Y, n_X] and return [E_y, n_Y, n_X].
-                Default: "corr".
-            **kwargs :
-                Passed through to PairwiseCCM.score_matrix. Useful keys:
-                - nbrs_num : int or list[int]
-                - theta    : float (for "smap")
+        Parameters
+        ----------
+        x : array-like, shape (time,) or (time, series)
+            Scalar source series, or columns of independent source series.
+        y : array-like or None
+            Corresponding targets. None uses x; a 1D target is shared by all
+            sources, and a 2D target must have the same number of columns as x.
+            Different source/target lengths use the existing suffix alignment.
+        library_size, sample_size : int, "auto", or None
+            Sampled library/query sizes. None uses the common length. "auto"
+            uses min(length // 2, 700) / min(length // 6, 250), respectively.
+        exclusion_window : int or None
+            Temporal exclusion radius; None permits self-neighbors.
+        E_range, tau_range, tp_range : 1D array-like of positive integers
+            Candidate dimensions, delays, and prediction horizons. The legacy
+            tp_max keyword expands horizons to np.arange(1, tp_max + 1).
+        method : {"simplex", "smap"}
+            Local regressor. Default is simplex.
+        trials : int
+            Number of random samples to average. Default is 3.
+        seed : int or None
+            Trial t uses seed + t. Every column uses the same sampling seeds,
+            matching separate 1D calls with this seed, regardless of batching.
+            None draws fresh random samples shared across columns on the fast
+            path.
+        metric : str
+            Any metric supported by PairwiseCCM.score_matrix. Selection keeps
+            the existing rule: maximize the mean score across horizons.
+        series_batch_size : positive int, "auto", or None
+            Number of series processed together by the float32 simplex/corr
+            path. "auto" estimates a size from memory_budget_gb; None batches
+            all series. Query batch_size can also be passed in kwargs.
+        **kwargs
+            Options for PairwiseCCM.score_matrix, including nbrs_num, theta,
+            subtract_global, batch_size, and clean_after. Options outside the
+            optimized simplex/corr path use the original per-series backend.
 
         Returns
         -------
-        dict
-            {
-            "E_range": array-like,                         # as provided
-            "tau_range": array-like,                       # as provided
-            "tp_range": np.ndarray,                        # as provided / resolved
-            "result": np.ndarray,                          # shape: (len(tp_range), len(tau_range), len(E_range))
-            "optimal_tau": int,                            # tau with highest mean over tp
-            "optimal_E": int,                              # E with highest mean over tp
-            "values": np.ndarray,                          # result[:, tau*, E*], shape: (len(tp_range),)
-            }
+        dict or list[dict]
+            A 1D input returns the existing dictionary: E_range, tau_range,
+            tp_range, result (horizon, tau, E), optimal_tau, optimal_E, and
+            values (scores at the optimum for each horizon). A 2D input returns
+            one such dictionary per column, in input order. No cross-series
+            predictions are computed. The fast path supports CPU and CUDA;
+            other devices, dtypes, and methods use the original backend.
         """
+        x = np.asarray(x)
+        scalar_input = x.ndim == 1
+        if scalar_input:
+            x = x[:, None]
+        if x.ndim != 2 or not all(x.shape):
+            raise ValueError("x must have shape (time,) or (time, series), with nonempty axes.")
         if y is None:
-            y = x  # Default Y to X if not provided
+            y = x
+        else:
+            y = np.asarray(y)
+            if y.ndim == 1:
+                y = np.broadcast_to(y[:, None], (len(y), x.shape[1]))
+            if y.ndim != 2 or not all(y.shape) or y.shape[1] != x.shape[1]:
+                raise ValueError("y must be 1D or have the same number of series as x.")
 
         legacy_tp_max = kwargs.pop("tp_max", None)
         if legacy_tp_max is not None:
             tp_range = np.arange(1, int(legacy_tp_max) + 1)
 
-        tp_range = np.asarray(tp_range, dtype=int)
-        if tp_range.ndim == 0:
-            tp_range = tp_range[None]
-        if tp_range.size == 0:
-            raise ValueError("tp_range must contain at least one positive integer.")
-        if np.any(tp_range <= 0):
-            raise ValueError("tp_range must contain only positive integers.")
+        def positive_grid(value, name):
+            arr = np.asarray(value)
+            if arr.ndim == 0:
+                arr = arr[None]
+            if (arr.ndim != 1 or not arr.size or arr.dtype.kind not in "iu"
+                    or np.any(arr <= 0)):
+                raise ValueError(f"{name} must contain positive integers in a nonempty 1D array.")
+            return arr.astype(int, copy=False)
+
+        E_range = positive_grid(E_range, "E_range")
+        tau_range = positive_grid(tau_range, "tau_range")
+        tp_range = positive_grid(tp_range, "tp_range")
+        if not isinstance(trials, (int, np.integer)) or trials < 1:
+            raise ValueError("trials must be a positive integer.")
+        if series_batch_size not in (None, "auto"):
+            if not isinstance(series_batch_size, (int, np.integer)) or series_batch_size < 1:
+                raise ValueError("series_batch_size must be positive, 'auto', or None.")
+        batch_size = kwargs.get("batch_size", "auto")
+        if batch_size not in (None, "auto"):
+            if not isinstance(batch_size, (int, np.integer)) or batch_size < 1:
+                raise ValueError("batch_size must be positive, 'auto', or None.")
         tp_max = int(tp_range.max())
-         
-        # Prepare embeddings and compute CCM for each tau and E combination
-        X_emb = np.concatenate([np.array([get_td_embedding_np(x[:-tp_max,None],e,tau)[:,:,0] for e in E_range],dtype=object) for tau in tau_range])
-        Y_emb = [y[: y.shape[0] - tp_max + tp, None] for tp in tp_range]
-        
-        res = np.mean([self.ccm.score_matrix(X_emb,Y_emb,
-                               library_size=library_size,
-                               sample_size=sample_size,
-                               exclusion_window=exclusion_window,
-                               tp=0,
-                               method=method,
-                               seed=None if seed is None else int(seed) + exp,
-                               metric=metric,
-                               **kwargs)[0].reshape(tp_range.shape[0],tau_range.shape[0],E_range.shape[0],) for exp in range(trials)],axis=0)
-        
+        min_len = min(len(x) - tp_max - (int(E_range.max()) - 1) * int(tau_range.max()),
+                      len(y) - tp_max + int(tp_range.min()))
+        if min_len < 1:
+            raise ValueError("Time series is too short for the embedding grid and prediction horizons.")
 
-        # Find optimal tau and E for this set
-        mean_over_tp = res.mean(axis=0)
-        max_idx = np.unravel_index(np.argmax(mean_over_tp), mean_over_tp.shape)
+        def resolve_size(value, divisor, cap, name):
+            if value is None:
+                return min_len
+            if value == "auto":
+                size = min(min_len // divisor, cap)
+            elif isinstance(value, (int, np.integer)):
+                size = min(int(value), min_len)
+            else:
+                raise ValueError(f"{name} must be a positive integer, 'auto', or None.")
+            if size < 1:
+                raise ValueError(f"{name} resolves to zero or is not positive.")
+            return size
 
-        # Return results as a dictionary
-        return {
-            "E_range": E_range,
-            "tau_range": tau_range,
-            "tp_range": tp_range,
-            "result": res,
-            "optimal_tau": tau_range[max_idx[0]],
-            "optimal_E": E_range[max_idx[1]],
-            "values": res[:, max_idx[0], max_idx[1]]
-        }
+        L = resolve_size(library_size, 2, 700, "library_size")
+        S = resolve_size(sample_size, 6, 250, "sample_size")
+        fast = (
+            method == "simplex" and metric == "corr" and len(x) == len(y)
+            and self.ccm.device.startswith(("cpu", "cuda"))
+            and self.ccm.dtype == torch.float32 and self.ccm.compute_dtype == torch.float32
+            and not kwargs.get("subtract_global", False)
+            and set(kwargs) <= {"batch_size", "clean_after", "subtract_global"}
+        )
+        scores = None
+        if fast:
+            from fastccm.utils.embedding_search import paired_embedding_scores
+            scores = paired_embedding_scores(
+                self.ccm, x, y, E_range=E_range, tau_range=tau_range, tp_range=tp_range,
+                library_size=L, sample_size=S, exclusion_window=exclusion_window,
+                trials=trials, seed=seed, series_batch_size=series_batch_size,
+                batch_size=batch_size,
+            )
+            if scores is not None and kwargs.get("clean_after", False):
+                from fastccm.utils.runtime import soft_clear
+                self.ccm._release_nbr_workspace()
+                soft_clear(self.ccm.logger, self.ccm.device)
+        if scores is None:
+            # Retain the full public backend for S-map, other metrics/dtypes,
+            # custom neighbor counts, global subtraction, and unequal lengths.
+            results = []
+            for i in range(x.shape[1]):
+                X_emb = [get_td_embedding_np(x[:-tp_max, i:i + 1], e, tau)[:, :, 0]
+                         for tau in tau_range for e in E_range]
+                Y_emb = [y[:len(y) - tp_max + tp, i:i + 1] for tp in tp_range]
+                results.append(np.mean([
+                    self.ccm.score_matrix(
+                        X_emb, Y_emb, library_size=library_size, sample_size=sample_size,
+                        exclusion_window=exclusion_window, tp=0, method=method,
+                        seed=None if seed is None else int(seed) + trial,
+                        metric=metric, **kwargs,
+                    )[0].reshape(len(tp_range), len(tau_range), len(E_range))
+                    for trial in range(trials)
+                ], axis=0))
+            scores = np.stack(results)
+
+        results = []
+        for res in scores:
+            best = np.unravel_index(np.argmax(res.mean(axis=0)), res.shape[1:])
+            results.append({
+                "E_range": E_range,
+                "tau_range": tau_range,
+                "tp_range": tp_range,
+                "result": res,
+                "optimal_tau": tau_range[best[0]],
+                "optimal_E": E_range[best[1]],
+                "values": res[:, best[0], best[1]],
+            })
+        return results[0] if scalar_input else results
 
 class Visualizer:
     def __init__(self):
