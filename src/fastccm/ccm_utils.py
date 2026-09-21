@@ -540,8 +540,11 @@ class Functions:
             all series. Query batch_size can also be passed in kwargs.
         **kwargs
             Options for PairwiseCCM.score_matrix, including nbrs_num, theta,
-            subtract_global, batch_size, and clean_after. Options outside the
-            optimized simplex/corr path use the original per-series backend.
+            subtract_global, batch_size, and clean_after. The fast path supports
+            global subtraction and nbrs_num as either an integer or one count
+            per candidate (tau-major, E-minor order), reused for each series.
+            Options outside the optimized simplex/corr path use the original
+            per-series backend.
 
         Returns
         -------
@@ -618,8 +621,7 @@ class Functions:
             method == "simplex" and metric == "corr" and len(x) == len(y)
             and self.ccm.device.startswith(("cpu", "cuda"))
             and self.ccm.dtype == torch.float32 and self.ccm.compute_dtype == torch.float32
-            and not kwargs.get("subtract_global", False)
-            and set(kwargs) <= {"batch_size", "clean_after", "subtract_global"}
+            and set(kwargs) <= {"batch_size", "clean_after", "subtract_global", "nbrs_num"}
         )
         scores = None
         if fast:
@@ -629,6 +631,8 @@ class Functions:
                 library_size=L, sample_size=S, exclusion_window=exclusion_window,
                 trials=trials, seed=seed, series_batch_size=series_batch_size,
                 batch_size=batch_size,
+                nbrs_num=kwargs.get("nbrs_num"),
+                subtract_global=kwargs.get("subtract_global", False),
             )
             if scores is not None and kwargs.get("clean_after", False):
                 from fastccm.utils.runtime import soft_clear
@@ -636,7 +640,7 @@ class Functions:
                 soft_clear(self.ccm.logger, self.ccm.device)
         if scores is None:
             # Retain the full public backend for S-map, other metrics/dtypes,
-            # custom neighbor counts, global subtraction, and unequal lengths.
+            # other options, and unequal lengths.
             results = []
             for i in range(x.shape[1]):
                 X_emb = [get_td_embedding_np(x[:-tp_max, i:i + 1], e, tau)[:, :, 0]

@@ -9,10 +9,48 @@ from .metrics import (
 )
 
 
+def _global_coefficients(ccm, X_lib, target_lib, candidates, groups):
+    """Fit corresponding global models in batches of equal embedding width.
+
+    Use the same intercept, normal equations, and initial regularization as
+    PairwiseCCM's global baseline. Ill-conditioned systems and nearly constant
+    predictions retain its scalar arithmetic, which affects correlation rounding.
+    """
+    beta = X_lib.new_zeros((X_lib.shape[0], X_lib.shape[2] + 1, target_lib.shape[2]))
+    scalar_rows = []
+    for width, rows in groups:
+        features = X_lib[..., :width].index_select(0, rows)
+        design = torch.cat([torch.ones_like(features[..., :1]), features], dim=-1)
+        targets = target_lib.index_select(0, rows // candidates)
+        gram = design.mT @ design
+        rhs = design.mT @ targets
+        eye = torch.eye(width + 1, device=gram.device, dtype=gram.dtype)
+        fitted, info = torch.linalg.solve_ex(gram + 1e-8 * eye, rhs)
+        chol, chol_info = torch.linalg.cholesky_ex(gram)
+        diagonal = chol.diagonal(dim1=-2, dim2=-1).abs()
+        unstable = ((info != 0) | (chol_info != 0)
+                    | (diagonal.amin(-1) < 1e-3 * diagonal.amax(-1)))
+        if ccm.device.startswith("cuda"):
+            # CUDA correlations accumulate in float32. Avoid changing the
+            # arithmetic when a large prediction mean masks its variance.
+            mean = (gram[:, :1] @ fitted).squeeze(1) / design.shape[1]
+            variance = (fitted * (gram @ fitted)).sum(1) / design.shape[1] - mean.square()
+            unstable |= (variance < 0.25 * mean.square()).any(-1)
+        if unstable.any():
+            for row in torch.nonzero(unstable, as_tuple=False).flatten().tolist():
+                scalar_beta = ccm._PairwiseCCM__solve_global_linear_beta(
+                    design[row], targets[row])
+                fitted[row] = scalar_beta
+                scalar_rows.append((int(rows[row]), width, scalar_beta))
+        beta[rows, :width + 1] = fitted
+    return beta, scalar_rows
+
+
 @torch.inference_mode()
 def paired_embedding_scores(
     ccm, x, y, *, E_range, tau_range, tp_range, library_size, sample_size,
     exclusion_window, trials, seed, series_batch_size, batch_size,
+    nbrs_num=None, subtract_global=False,
 ):
     """Return [series, horizon, tau, E], or None if the resident grid is too big.
 
@@ -28,9 +66,14 @@ def paired_embedding_scores(
     max_lag = int(((E - 1) * tau).max())
     common_len = n_time - int(max(tp_range)) - max_lag
     L, S = library_size, sample_size
-    k_max = width + 1
+    counts = E + 1 if nbrs_num is None else np.asarray(nbrs_num)
+    if counts.ndim == 0:
+        counts = np.full(g, counts.item())
+    if (counts.shape != (g,) or counts.dtype.kind not in "iu" or np.any(counts < 1)):
+        raise ValueError("nbrs_num must be a positive integer or one positive integer per (tau, E) candidate.")
+    k_max = int(counts.max())
     if L < k_max:
-        raise ValueError("library_size must provide at least max(E_range) + 1 points.")
+        raise ValueError("library_size must provide at least the requested number of neighbors.")
 
     # Conservative working-set estimate: raw inputs, sampled library and its
     # augmented operand, query vectors, distance/topk scratch, gathers, and
@@ -41,6 +84,12 @@ def paired_embedding_scores(
     fixed_bytes = raw_bytes + g * (4 * L * (2 * width + 2) + 64 * horizons_count)
     query_bytes = g * (8 * L + 8 * width + k_max * (32 + 4 * horizons_count)
                        + 64 * horizons_count)
+    if subtract_global:
+        fixed_bytes += g * (4 * L * (2 * width + 1 + horizons_count)
+                           + 4 * (width + 1) * (width + 1 + 3 * horizons_count)
+                           + 64 * horizons_count)
+        fixed_bytes += 4 * S * horizons_count
+        query_bytes += g * (4 * (width + 1) + 64 * horizons_count)
     if fixed_bytes + query_bytes > budget:
         return None
     requested_queries = S if batch_size in (None, "auto") else min(S, batch_size)
@@ -66,7 +115,7 @@ def paired_embedding_scores(
         valid_np, (columns[None, :] - E[:, None] + 1) * tau[:, None], 0), device=device)
     valid = torch.as_tensor(valid_np, device=device)
     horizons = torch.as_tensor(tp_range, device=device)
-    neighbors_per_candidate = torch.as_tensor(E + 1, device=device)
+    neighbors_per_candidate = torch.as_tensor(counts, device=device)
     # Draw once per trial so changing batch sizes cannot change the experiment.
     trial_indices = []
     for trial in range(trials):
@@ -88,6 +137,10 @@ def paired_embedding_scores(
         k = neighbors_per_candidate.repeat(n)
         series_offsets = torch.arange(n, device=device)[:, None, None, None] * L
         total = torch.zeros((n, horizons_count, g), device=device, dtype=ccm.compute_dtype)
+        if subtract_global:
+            dimensions = np.tile(E, n)
+            groups = [(int(e), torch.as_tensor(np.flatnonzero(dimensions == e), device=device))
+                      for e in np.unique(E)]
 
         def sampled(times):
             a = raw_x[:, times[None, :, None] + offsets[:, None, :]]
@@ -102,6 +155,14 @@ def paired_embedding_scores(
             target_lib = raw_y[:, lib_t[:, None] + horizons[None, :]].contiguous()
             state = stream_metric_state_init("corr", 1, horizons_count, n * g,
                 device=device, dtype=ccm.compute_dtype, shared_target=False)
+            if subtract_global:
+                beta, scalar_rows = _global_coefficients(ccm, X_lib, target_lib, g, groups)
+                # Preserve the original reduction layout per series. This is
+                # significant for nearly constant global predictions on CUDA.
+                global_states = [stream_metric_state_init("corr", 1, horizons_count, g,
+                    device=device, dtype=ccm.compute_dtype, shared_target=False) for _ in range(n)]
+                global_targets = raw_y[:, (sample_indices + max_lag)[:, None]
+                                       + horizons[None, :]].transpose(1, 2).contiguous()
             for q0 in range(0, S, query_chunk):
                 sample_idx = sample_indices[q0:q0 + query_chunk]
                 sample_t = sample_idx + max_lag
@@ -120,8 +181,26 @@ def paired_embedding_scores(
                 observed = truth[:, None].expand(n, g, q, horizons_count).reshape(
                     n * g, q, horizons_count).permute(1, 2, 0).unsqueeze(1).contiguous()
                 stream_metric_state_update("corr", state, pred, observed)
+                if subtract_global:
+                    design = torch.cat([torch.ones_like(X_sample[..., :1]), X_sample], dim=-1)
+                    global_pred = torch.bmm(design, beta)
+                    for row, width_i, scalar_beta in scalar_rows:
+                        global_pred[row] = design[row, :, :width_i + 1].contiguous() @ scalar_beta
+                    global_pred = global_pred.reshape(n, g, q, horizons_count)
+                    for i, global_state in enumerate(global_states):
+                        A = global_pred[i].permute(1, 2, 0).unsqueeze(1).contiguous()
+                        B = global_targets[i, :, q0:q0 + q].unsqueeze(-1).permute(
+                            1, 2, 0).unsqueeze(-1).expand(q, 1, horizons_count, g)
+                        stream_metric_state_update("corr", global_state, A, B)
+                    del A, B
+                    del design, global_pred
                 del X_sample, weights, indices, adjusted, targets, pred, truth, observed
-            total += stream_metric_state_finalize("corr", state)[0].reshape(
+            score = stream_metric_state_finalize("corr", state)
+            if subtract_global:
+                score -= torch.cat([stream_metric_state_finalize("corr", s)
+                                    for s in global_states], dim=-1)
+                del beta, scalar_rows, global_states, global_targets
+            total += score[0].reshape(
                 horizons_count, n, g).permute(1, 0, 2)
             del X_lib, lib_index, target_lib, state
         output[start:stop] = (total / trials).cpu().numpy()
