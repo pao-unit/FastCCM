@@ -24,6 +24,7 @@ from .utils.runtime import (
     smap_xtwx_precompute_bytes,
     smap_xtwy_precompute_bytes,
     batch_starts,
+    knn_dist_row_width,
     resolve_simplex_target_batch_size,
 )
 from .utils.logger import setup_logger
@@ -1927,8 +1928,7 @@ class PairwiseCCM:
                     sel = (dist.shape[0], dist.shape[1], n_nbrs_max)
                     near_dist = self.__workspace("near_dist", sel, dist.dtype)
                     indices = self.__workspace("indices", sel, torch.long)
-                    torch.topk(dist, n_nbrs_max, dim=2, largest=False, sorted=False,
-                               out=(near_dist, indices))
+                    self.__select_smallest(dist, n_nbrs_max, near_dist, indices)
                 near_dist.clamp_min_(0).sqrt_()
 
         with time_block(self.logger, self.device, timings, "weights"):
@@ -2055,17 +2055,54 @@ class PairwiseCCM:
         distances slightly negative, so this may choose a different member of a
         zero-distance tie than the native path. Square-root rounding can likewise
         create ties after selection.
+
+        The result is a view into rows `knn_dist_row_width` may make longer
+        than the library.
         """
         comp = self._promoted_compute_dtype()
         q = self.__to_tensor(sample, dtype=comp)
         sq = q.pow(2).sum(-1, True)
         pad = torch.ones_like(sq)
         augmented = torch.cat([q.mul(-2), sq, pad], -1)
-        dist = self.__workspace(
-            "dist", (q.shape[0], q.shape[1], lib_index.num_points), comp
-        )
+        num_lib = lib_index.num_points
+        width = knn_dist_row_width(num_lib, self.device)
+        rows = self.__workspace("dist", (q.shape[0], q.shape[1], width), comp)
+        dist = rows[..., :num_lib]
         torch.matmul(augmented, lib_index.augmented.mT, out=dist)
         return dist
+
+    _INTEGER_KEY_DTYPES = {torch.float32: torch.int32, torch.float64: torch.int64}
+
+    def __select_smallest(self, dist, k, values, indices):
+        """
+        `topk(dist, k, largest=False, sorted=False)` into `values`/`indices`.
+
+        On CPU, topk's NaN-aware float comparator makes it ~1.5x slower than on
+        the same bits read as integers. Those order identically unless a row
+        holds two values with the sign bit set, which reverse, -0.0, which then
+        ranks below +0.0, or -NaN, which ranks first rather than last. Sign-bit
+        values rank below every other value as integers, so a row that holds
+        any shows them in its selection. Such rows, and rows that select NaN,
+        are ranked again as floats, so the selection is the float one.
+        """
+        key_dtype = self._INTEGER_KEY_DTYPES.get(dist.dtype)
+        if not self.device.startswith("cpu") or key_dtype is None or k < 2:
+            torch.topk(dist, k, dim=2, largest=False, sorted=False, out=(values, indices))
+            return
+        keys = values.view(key_dtype)
+        torch.topk(dist.view(key_dtype), k, dim=2, largest=False, sorted=False,
+                   out=(keys, indices))
+        lowest, highest = torch.aminmax(keys)
+        inf_key = torch.tensor(float("inf"), dtype=dist.dtype).view(key_dtype)
+        if lowest < 0 or highest > inf_key:
+            redo = ((keys < 0).sum(2) > 1) | (keys == torch.iinfo(key_dtype).min).any(2)
+            redo |= values.isnan().any(2)
+            if redo.any():
+                src, query = redo.nonzero(as_tuple=True)
+                redo_values, redo_indices = torch.topk(
+                    dist[src, query], k, dim=1, largest=False, sorted=False)
+                values[src, query] = redo_values
+                indices[src, query] = redo_indices
 
     def __weights_from_dists(self, near_dist, indices, n_nbrs, n_nbrs_max):
         timings = {}

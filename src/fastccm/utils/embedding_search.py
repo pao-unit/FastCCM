@@ -109,6 +109,19 @@ def paired_embedding_scores(
     if retained > budget // 4:
         ccm._release_nbr_workspace()
 
+    # E = 1 embeds x(t) for every tau, so those candidates repeat one neighbor
+    # search. Search each distinct (E, lags, neighbor count) once, and expand
+    # the predictions back to the grid before scoring so the metric reductions,
+    # and with them the scores, keep their bits.
+    key = np.stack([E, np.where(E > 1, tau, 0), counts], axis=1)
+    _, first, inverse = np.unique(key, axis=0, return_index=True, return_inverse=True)
+    order = np.argsort(first)
+    slot = np.empty_like(order)
+    slot[order] = np.arange(len(order))
+    to_grid = torch.as_tensor(slot[inverse.reshape(-1)], device=device)
+    E, tau, counts = E[first[order]], tau[first[order]], counts[first[order]]
+    c = len(order)
+
     columns = np.arange(width)
     valid_np = columns[None, :] < E[:, None]
     offsets = torch.as_tensor(np.where(
@@ -146,7 +159,7 @@ def paired_embedding_scores(
             a = raw_x[:, times[None, :, None] + offsets[:, None, :]]
             # Invalid padding must be zero even for non-finite input values.
             a.masked_fill_(~valid[None, :, None, :], 0)
-            return a.reshape(n * g, len(times), width).contiguous()
+            return a.reshape(n * c, len(times), width).contiguous()
 
         for lib_indices, sample_indices in trial_indices:
             lib_t = lib_indices + max_lag
@@ -156,7 +169,7 @@ def paired_embedding_scores(
             state = stream_metric_state_init("corr", 1, horizons_count, n * g,
                 device=device, dtype=ccm.compute_dtype, shared_target=False)
             if subtract_global:
-                beta, scalar_rows = _global_coefficients(ccm, X_lib, target_lib, g, groups)
+                beta, scalar_rows = _global_coefficients(ccm, X_lib, target_lib, c, groups)
                 # Preserve the original reduction layout per series. This is
                 # significant for nearly constant global predictions on CUDA.
                 global_states = [stream_metric_state_init("corr", 1, horizons_count, g,
@@ -171,11 +184,12 @@ def paired_embedding_scores(
                 weights, indices = ccm._PairwiseCCM__get_nbrs_indices_with_weights(
                     X_lib, X_sample, k, k_max, lib_indices, sample_idx,
                     exclusion_window, lib_index=lib_index)
-                adjusted = indices.reshape(n, g, q, k_max) + series_offsets
+                adjusted = indices.reshape(n, c, q, k_max) + series_offsets
                 targets = torch.index_select(target_lib.reshape(n * L, horizons_count),
                                              0, adjusted.reshape(-1))
-                pred = torch.bmm(weights.reshape(n * g * q, 1, k_max),
-                                 targets.reshape(n * g * q, k_max, horizons_count))
+                pred = torch.bmm(weights.reshape(n * c * q, 1, k_max),
+                                 targets.reshape(n * c * q, k_max, horizons_count))
+                pred = pred.reshape(n, c, q, horizons_count).index_select(1, to_grid)
                 pred = pred.reshape(n * g, q, horizons_count).permute(1, 2, 0).unsqueeze(1).contiguous()
                 truth = raw_y[:, sample_t[:, None] + horizons[None, :]]
                 observed = truth[:, None].expand(n, g, q, horizons_count).reshape(
@@ -186,7 +200,7 @@ def paired_embedding_scores(
                     global_pred = torch.bmm(design, beta)
                     for row, width_i, scalar_beta in scalar_rows:
                         global_pred[row] = design[row, :, :width_i + 1].contiguous() @ scalar_beta
-                    global_pred = global_pred.reshape(n, g, q, horizons_count)
+                    global_pred = global_pred.reshape(n, c, q, horizons_count).index_select(1, to_grid)
                     for i, global_state in enumerate(global_states):
                         A = global_pred[i].permute(1, 2, 0).unsqueeze(1).contiguous()
                         B = global_targets[i, :, q0:q0 + q].unsqueeze(-1).permute(

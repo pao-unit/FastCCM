@@ -140,6 +140,21 @@ def _resolve_batch_size(total_samples: int, budget_bytes: int, base_bytes: int, 
     return int(batch_size)
 
 
+def knn_dist_row_width(num_lib: int, device) -> int:
+    """
+    Allocated row length of the neighbor-distance block.
+
+    CPU rows are padded to a 64-byte multiple, which makes the distance matmul
+    ~1.2x faster on Apple silicon; other devices use the library size. The
+    at most 15 extra columns stay inside SIMPLEX_SEARCH_SAFETY_FACTOR, so the
+    batch estimates keep the library size and their batch plans.
+    """
+    num_lib = int(num_lib)
+    if not str(device).startswith("cpu"):
+        return num_lib
+    return -(-num_lib // 16) * 16
+
+
 def _simplex_base_bytes(
     *,
     num_ts_X: int,
